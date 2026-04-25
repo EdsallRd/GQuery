@@ -134,7 +134,7 @@ gq.from("Employees", EmployeeSchema).append(
 `GQuerySchemaError` extends `Error` and exposes the full list of issues from the schema library, plus the raw row that failed.
 
 ```typescript
-import { GQuerySchemaError } from "@fcps-tssc/GQuery";
+import { GQuerySchemaError } from "@imreallyliam/gquery";
 
 try {
   const result = gq.from("Employees", EmployeeSchema).get({ validate: true });
