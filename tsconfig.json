@@ -17,6 +17,9 @@
         "declarationDir": "dist/types",
         "rootDir": "./src",
         "emitDeclarationOnly": true,
+        "types": [
+            "google-apps-script"
+        ]
     },
     "include": [
         "src/**/*.ts"
