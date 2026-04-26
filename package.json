@@ -13,7 +13,7 @@
     "build": "rollup -c"
   },
   "dependencies": {
-    "@types/google-apps-script": "^1.0.97"
+    "@types/google-apps-script": "^2.0.8"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^28.0.3",
