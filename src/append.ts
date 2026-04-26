@@ -59,7 +59,7 @@ export function appendInternal<
 
   // Fetch headers from the first row
   const response = callHandler(() =>
-    Sheets.Spreadsheets!.Values!.get(spreadsheetId, `${sheetName}!1:1`),
+    Sheets!.Spreadsheets!.Values!.get(spreadsheetId, `${sheetName}!1:1`),
   );
 
   // Validate sheet exists and has headers
@@ -80,7 +80,7 @@ export function appendInternal<
 
   // Append data using Sheets API
   const appendResponse = callHandler(() =>
-    Sheets.Spreadsheets!.Values!.append(
+    Sheets!.Spreadsheets!.Values!.append(
       { values: rowsToAppend },
       spreadsheetId,
       sheetName,

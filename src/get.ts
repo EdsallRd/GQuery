@@ -131,7 +131,7 @@ export function getManyInternal(
 
   // Fetch data using batchGet for better performance
   const dataResponse = callHandler(() =>
-    Sheets.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
+    Sheets!.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
       ranges: sheetNames,
       valueRenderOption,
       dateTimeRenderOption,

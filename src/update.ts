@@ -113,7 +113,7 @@ export function updateInternal<
     };
 
     callHandler(() =>
-      Sheets.Spreadsheets!.Values!.batchUpdate(
+      Sheets!.Spreadsheets!.Values!.batchUpdate(
         batchUpdateRequest,
         spreadsheetId,
       ),

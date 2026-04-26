@@ -51,7 +51,7 @@ export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
   // Execute batch delete
   try {
     callHandler(() =>
-      Sheets.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
+      Sheets!.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
     );
     return { deletedRows: rowsToDelete.length };
   } catch (error) {
