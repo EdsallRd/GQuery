@@ -1,9 +1,14 @@
 {
-  "name": "@imreallyliam/gquery",
+  "name": "@edsallrd/gquery",
   "version": "1.5.3",
   "main": "dist/bundle.js",
   "types": "dist/bundle.d.ts",
   "source": "src/index.ts",
+  "author": "Edsall Park <https://github.com/EdsallRd>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EdsallRd/gquery.git"
+  },
   "scripts": {
     "build": "rollup -c"
   },
