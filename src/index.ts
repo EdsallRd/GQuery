@@ -203,6 +203,41 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
+   * Get a single row by its `id` field.
+   * @param id Value of the row's `id` field
+   * @returns The matching row, or undefined if no row matches
+   */
+  getById(id: T extends { id: infer Id } ? Id : string | number): GQueryRow<T> | undefined {
+    const result = this.where((row: any) => row.id === id).get();
+    return result.rows[0];
+  }
+
+  /**
+   * Update a single row identified by its `id` field.
+   * The mutator may either mutate the row in place or return a Partial<T> — both styles are handled.
+   * @param id Value of the row's `id` field
+   * @param mutator Function that mutates the row in place or returns updated field values
+   */
+  updateById(
+    id: T extends { id: infer Id } ? Id : string | number,
+    mutator: (row: T) => void | Partial<T>,
+  ): void {
+    this.where((row: any) => row.id === id).update((row) => {
+      const copy = { ...row } as T;
+      const returned = mutator(copy);
+      return returned !== undefined ? returned : copy;
+    });
+  }
+
+  /**
+   * Delete a single row identified by its `id` field.
+   * @param id Value of the row's `id` field
+   */
+  deleteById(id: T extends { id: infer Id } ? Id : string | number): void {
+    this.where((row: any) => row.id === id).delete();
+  }
+
+  /**
    * Execute a Google Visualization API query
    * @param query Query string in Google Query Language
    * @returns GQueryResult with query results
