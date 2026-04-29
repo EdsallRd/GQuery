@@ -135,6 +135,16 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
+   * Sort rows by a field before returning
+   * @param field Column name to sort by
+   * @param direction Sort direction: "asc" (default) or "desc"
+   * @returns GQueryTableFactory for chaining
+   */
+  orderBy(field: keyof T & string, direction: "asc" | "desc" = "asc"): GQueryTableFactory<T> {
+    return new GQueryTableFactory<T>(this).orderBy(field, direction);
+  }
+
+  /**
    * Join with another sheet.
    * Note: joined columns are typed as additional `any` fields alongside T.
    *
@@ -272,6 +282,7 @@ export class GQueryTableFactory<
     joinColumn: string;
     columnsToReturn?: string[];
   }[] = [];
+  orderByState?: { field: string; direction: "asc" | "desc" };
 
   constructor(GQueryTable: GQueryTable<T>) {
     this.GQueryTable = GQueryTable;
@@ -284,6 +295,11 @@ export class GQueryTableFactory<
 
   where(filterFn: (row: GQueryRow<T>) => boolean): GQueryTableFactory<T> {
     this.filterOption = filterFn;
+    return this;
+  }
+
+  orderBy(field: keyof T & string, direction: "asc" | "desc" = "asc"): this {
+    this.orderByState = { field, direction };
     return this;
   }
 
@@ -303,7 +319,7 @@ export class GQueryTableFactory<
   }
 
   get(options?: GQueryReadOptions): GQueryResult<T> {
-    return getInternal<T>(this, options);
+    return getInternal<T>(this, options, this.orderByState);
   }
 
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {

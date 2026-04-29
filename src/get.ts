@@ -12,6 +12,23 @@ import {
 import { normalizeForSchema, parseRows } from "./utils";
 
 /**
+ * Sort rows by a single field. Returns the input array unchanged if no orderBy is provided.
+ * The comparator uses `<`/`>` so it works for both numbers and lexically-comparable strings.
+ */
+function sortRows<T>(
+  rows: T[],
+  orderBy: { field: string; direction: "asc" | "desc" } | undefined,
+): T[] {
+  if (!orderBy) return rows;
+  return [...rows].sort((a, b) => {
+    const av = (a as any)[orderBy.field];
+    const bv = (b as any)[orderBy.field];
+    const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+    return orderBy.direction === "desc" ? -cmp : cmp;
+  });
+}
+
+/**
  * Validate a single row through a Standard Schema.
  * Throws GQuerySchemaError if validation fails.
  * Throws a plain Error if the schema returns a Promise (async schemas are not
@@ -170,6 +187,7 @@ export function getInternal<
 >(
   GQueryTableFactory: GQueryTableFactory<T>,
   options?: GQueryReadOptions,
+  orderBy?: { field: string; direction: "asc" | "desc" },
 ): GQueryResult<T> {
   const GQueryTable = GQueryTableFactory.GQueryTable;
   const GQuery = GQueryTable.GQuery;
@@ -327,6 +345,9 @@ export function getInternal<
       return selectedRow;
     });
 
+    // Apply sort if specified
+    rows = sortRows(rows, orderBy);
+
     // Apply schema validation if requested
     const typedRows =
       GQueryTable.schema && options?.validate
@@ -338,6 +359,9 @@ export function getInternal<
       rows: typedRows,
     };
   }
+
+  // Apply sort if specified
+  rows = sortRows(rows, orderBy);
 
   // Apply schema validation if requested
   const typedRows =
