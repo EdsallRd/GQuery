@@ -145,6 +145,24 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
+   * Limit the number of rows returned.
+   * @param n Maximum number of rows
+   * @returns GQueryTableFactory for chaining
+   */
+  limit(n: number): GQueryTableFactory<T> {
+    return new GQueryTableFactory<T>(this).limit(n);
+  }
+
+  /**
+   * Skip the first N rows before returning.
+   * @param n Number of rows to skip
+   * @returns GQueryTableFactory for chaining
+   */
+  offset(n: number): GQueryTableFactory<T> {
+    return new GQueryTableFactory<T>(this).offset(n);
+  }
+
+  /**
    * Join with another sheet.
    * Note: joined columns are typed as additional `any` fields alongside T.
    *
@@ -283,6 +301,8 @@ export class GQueryTableFactory<
     columnsToReturn?: string[];
   }[] = [];
   orderByState?: { field: string; direction: "asc" | "desc" };
+  limitState?: number;
+  offsetState?: number;
 
   constructor(GQueryTable: GQueryTable<T>) {
     this.GQueryTable = GQueryTable;
@@ -303,6 +323,16 @@ export class GQueryTableFactory<
     return this;
   }
 
+  limit(n: number): this {
+    this.limitState = n;
+    return this;
+  }
+
+  offset(n: number): this {
+    this.offsetState = n;
+    return this;
+  }
+
   join(
     sheetName: string,
     sheetColumn: string,
@@ -319,7 +349,7 @@ export class GQueryTableFactory<
   }
 
   get(options?: GQueryReadOptions): GQueryResult<T> {
-    return getInternal<T>(this, options, this.orderByState);
+    return getInternal<T>(this, options, this.orderByState, this.limitState, this.offsetState);
   }
 
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {

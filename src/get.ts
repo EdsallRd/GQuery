@@ -12,6 +12,23 @@ import {
 import { normalizeForSchema, parseRows } from "./utils";
 
 /**
+ * Apply offset and limit to a row array. Returns a new array (or the original if both are absent).
+ */
+function paginateRows<T>(
+  rows: T[],
+  offset: number | undefined,
+  limit: number | undefined,
+): T[] {
+  if (typeof offset === "number" && offset > 0) {
+    rows = rows.slice(offset);
+  }
+  if (typeof limit === "number" && limit >= 0) {
+    rows = rows.slice(0, limit);
+  }
+  return rows;
+}
+
+/**
  * Sort rows by a single field. Returns the input array unchanged if no orderBy is provided.
  * The comparator uses `<`/`>` so it works for both numbers and lexically-comparable strings.
  */
@@ -188,6 +205,8 @@ export function getInternal<
   GQueryTableFactory: GQueryTableFactory<T>,
   options?: GQueryReadOptions,
   orderBy?: { field: string; direction: "asc" | "desc" },
+  limit?: number,
+  offset?: number,
 ): GQueryResult<T> {
   const GQueryTable = GQueryTableFactory.GQueryTable;
   const GQuery = GQueryTable.GQuery;
@@ -284,7 +303,9 @@ export function getInternal<
     rows = rows.filter(GQueryTableFactory.filterOption);
   }
 
-  // Apply select if specified
+  // Apply select if specified — narrows columns and shifts the effective `headers`
+  // we return. Sort/paginate/validate run once below regardless of branch.
+  let outputHeaders = headers;
   if (
     GQueryTableFactory.selectOption &&
     GQueryTableFactory.selectOption.length > 0
@@ -345,23 +366,12 @@ export function getInternal<
       return selectedRow;
     });
 
-    // Apply sort if specified
-    rows = sortRows(rows, orderBy);
-
-    // Apply schema validation if requested
-    const typedRows =
-      GQueryTable.schema && options?.validate
-        ? applySchemaToRows(GQueryTable.schema, rows)
-        : (rows as unknown as GQueryRow<T>[]);
-
-    return {
-      headers: selectedHeaders,
-      rows: typedRows,
-    };
+    outputHeaders = selectedHeaders;
   }
 
-  // Apply sort if specified
+  // Apply sort then pagination if specified — single call site for both branches
   rows = sortRows(rows, orderBy);
+  rows = paginateRows(rows, offset, limit);
 
   // Apply schema validation if requested
   const typedRows =
@@ -370,7 +380,7 @@ export function getInternal<
       : (rows as unknown as GQueryRow<T>[]);
 
   return {
-    headers,
+    headers: outputHeaders,
     rows: typedRows,
   };
 }
