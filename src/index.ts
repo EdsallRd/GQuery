@@ -1,6 +1,6 @@
 import { getInternal, getManyInternal, queryInternal } from "./get";
 import { updateInternal } from "./update";
-import { appendInternal } from "./append";
+import { appendInternal, appendOneInternal } from "./append";
 import { deleteInternal } from "./delete";
 import {
   GQueryReadOptions,
@@ -181,6 +181,16 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
     return appendInternal<T>(this, dataArray, options);
+  }
+
+  /**
+   * Append a single row and return the inserted row directly (not wrapped in a result).
+   * @param row Object to append
+   * @param options Optional validation flag
+   * @returns The inserted row with __meta populated
+   */
+  appendOne(row: T, options?: Pick<GQueryReadOptions, "validate">): GQueryRow<T> {
+    return appendOneInternal<T>(this, row, options);
   }
 
   /**

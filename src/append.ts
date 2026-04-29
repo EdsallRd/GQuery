@@ -145,3 +145,24 @@ export function appendInternal<
     headers,
   };
 }
+
+/**
+ * Append a single row and return it directly (not wrapped in a GQueryResult).
+ * @param table The GQueryTable to append to
+ * @param row Object to append
+ * @param options Optional validation flag
+ * @returns The inserted row with __meta populated
+ */
+export function appendOneInternal<
+  T extends Record<string, any> = Record<string, any>,
+>(
+  table: GQueryTable<T>,
+  row: T,
+  options?: Pick<GQueryReadOptions, "validate">,
+): GQueryRow<T> {
+  const result = appendInternal<T>(table, [row], options);
+  if (result.rows.length === 0) {
+    throw new Error(`appendOne: append succeeded but returned no rows`);
+  }
+  return result.rows[0];
+}
