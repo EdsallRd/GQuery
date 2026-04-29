@@ -1,5 +1,6 @@
 import { GQueryTableFactory } from "./index";
 import { callHandler } from "./ratelimit";
+import { GQueryApiError } from "./types";
 import { fetchSheetData } from "./utils";
 
 export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
@@ -9,15 +10,14 @@ export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
   const sheetName = GQueryTableFactory.GQueryTable.sheetName;
   const sheet = GQueryTableFactory.GQueryTable.sheet;
   const sheetId = sheet.getSheetId();
+  const cache = GQueryTableFactory.GQueryTable.GQuery.cache;
 
-  const { rows } = fetchSheetData(spreadsheetId, sheetName);
+  const { rows } = fetchSheetData(spreadsheetId, sheetName, cache);
 
-  // Check if filter is specified and rows exist
   if (!GQueryTableFactory.filterOption || rows.length === 0) {
     return { deletedRows: 0 };
   }
 
-  // Find rows matching the filter condition
   const rowsToDelete = rows.filter((row) => {
     try {
       return GQueryTableFactory.filterOption!(row);
@@ -34,28 +34,36 @@ export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
   // Sort in descending order to avoid row number shifting issues
   rowsToDelete.sort((a, b) => b.__meta.rowNum - a.__meta.rowNum);
 
-  // Build batch delete request
   const batchUpdateRequest = {
     requests: rowsToDelete.map((row) => ({
       deleteDimension: {
         range: {
           sheetId,
           dimension: "ROWS",
-          startIndex: row.__meta.rowNum - 1, // Convert to 0-based index
-          endIndex: row.__meta.rowNum, // End-exclusive range
+          startIndex: row.__meta.rowNum - 1,
+          endIndex: row.__meta.rowNum,
         },
       },
     })),
   };
 
-  // Execute batch delete
   try {
-    callHandler(() =>
-      Sheets!.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
+    callHandler(
+      () => Sheets!.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
+      20,
+      { operation: `Spreadsheets.batchUpdate(delete:${sheetName})` },
     );
-    return { deletedRows: rowsToDelete.length };
   } catch (error) {
-    console.error("Error deleting rows:", error);
-    throw new Error(`Failed to delete rows: ${error}`);
+    if (error instanceof GQueryApiError) throw error;
+    throw new GQueryApiError(
+      `Spreadsheets.batchUpdate(delete:${sheetName})`,
+      null,
+      `Failed to delete ${rowsToDelete.length} row(s) from "${sheetName}".`,
+      error,
+    );
   }
+
+  cache?.invalidate(sheetName);
+
+  return { deletedRows: rowsToDelete.length };
 }

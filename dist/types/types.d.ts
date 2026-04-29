@@ -45,6 +45,31 @@ export declare namespace StandardSchemaV1 {
  */
 export type InferSchema<S> = S extends StandardSchemaV1<any, infer O> ? O : Record<string, unknown>;
 /**
+ * CacheService scope. Document scope is the right grain for an ORM that
+ * always operates against one spreadsheet — keeps separate caches per file.
+ */
+export type GQueryCacheScope = "document" | "script" | "user";
+/**
+ * Cache configuration. Pass `false` to disable caching entirely on an
+ * instance or a single call.
+ */
+export type GQueryCacheOptions = false | {
+    /** Which CacheService scope to use. Defaults to "document". */
+    scope?: GQueryCacheScope;
+    /** TTL overrides (seconds). Headers default to 3600, data to 600, query to 300. */
+    ttl?: {
+        headers?: number;
+        data?: number;
+        query?: number;
+    };
+    /** Rows per chunk before splitting across cache keys. Default 50. */
+    chunkSize?: number;
+    /** Bytes above which a chunk is gzipped before storage. Default 50_000. */
+    compressThreshold?: number;
+    /** Optional namespace suffix to isolate caches across deployments. */
+    namespace?: string;
+};
+/**
  * Options for reading data from Google Sheets
  */
 export type GQueryReadOptions = {
@@ -58,6 +83,11 @@ export type GQueryReadOptions = {
      * Defaults to false (schema is used for type inference only).
      */
     validate?: boolean;
+    /**
+     * Per-call cache override. Set to `false` to bypass the cache (and skip
+     * writing the result back) for this read.
+     */
+    cache?: GQueryCacheOptions;
 };
 /**
  * Result structure returned by GQuery operations
@@ -74,7 +104,7 @@ export type GQueryResult<T = Record<string, any>> = {
  */
 export type GQueryRow<T = Record<string, any>> = T & {
     __meta: {
-        /** 1-based row number in the sheet (row 1 is headers) */
+        /** 1-based row number in the sheet (row 1 is headers). -1 when unknown. */
         rowNum: number;
         /** Number of columns in the row */
         colLength: number;
@@ -103,10 +133,43 @@ export declare enum DateTimeRenderOption {
     SERIAL_NUMBER = "SERIAL_NUMBER"
 }
 /**
+ * Comparison operators supported by the typed query builder.
+ * These map directly to Google Visualization API (gviz/tq) operators.
+ */
+export type GQueryComparisonOp = "=" | "!=" | "<" | "<=" | ">" | ">=" | "contains" | "starts with" | "ends with" | "matches";
+/**
+ * Typed predicate that compiles to a server-side gviz/tq filter.
+ * Use `.whereExpr()` instead of `.where()` to push the filter to Google's
+ * servers (returns only matching rows over the wire).
+ */
+export type GQueryWhereExpr = {
+    col: string;
+    op: GQueryComparisonOp;
+    value: string | number | boolean | null | Date;
+} | {
+    and: GQueryWhereExpr[];
+} | {
+    or: GQueryWhereExpr[];
+} | {
+    not: GQueryWhereExpr;
+};
+/**
  * Thrown when a row fails schema validation.
  */
 export declare class GQuerySchemaError extends Error {
     readonly issues: ReadonlyArray<StandardSchemaV1.Issue>;
     readonly row: Record<string, any>;
     constructor(issues: ReadonlyArray<StandardSchemaV1.Issue>, row: Record<string, any>);
+}
+/**
+ * Thrown when a Google API call fails in a non-retryable way (or after
+ * retries are exhausted). Carries the operation name, status code, and
+ * response body for debugging.
+ */
+export declare class GQueryApiError extends Error {
+    readonly operation: string;
+    readonly status: number | null;
+    readonly body: string;
+    readonly cause?: unknown | undefined;
+    constructor(operation: string, status: number | null, body: string, cause?: unknown | undefined);
 }

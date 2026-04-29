@@ -1,6 +1,7 @@
 import { GQueryTable } from "./index";
 import { callHandler } from "./ratelimit";
 import {
+  GQueryApiError,
   GQueryReadOptions,
   GQueryResult,
   GQueryRow,
@@ -40,7 +41,6 @@ export function appendInternal<
   data: T[],
   options?: Pick<GQueryReadOptions, "validate">,
 ): GQueryResult<T> {
-  // Validate input data
   if (!data || data.length === 0) {
     return { rows: [], headers: [] };
   }
@@ -48,6 +48,7 @@ export function appendInternal<
   const spreadsheetId = table.spreadsheetId;
   const sheetName = table.sheetName;
   const schema = table.schema;
+  const cache = table.GQuery.cache;
 
   // Validate each item through the schema before writing, if requested
   const validatedData: T[] =
@@ -58,13 +59,19 @@ export function appendInternal<
       : data;
 
   // Fetch headers from the first row
-  const response = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.get(spreadsheetId, `${sheetName}!1:1`),
+  const response = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.get(spreadsheetId, `${sheetName}!1:1`),
+    20,
+    { operation: `Values.get(${sheetName}!1:1)` },
   );
 
-  // Validate sheet exists and has headers
   if (!response || !response.values || response.values.length === 0) {
-    throw new Error(`Sheet "${sheetName}" not found or has no headers`);
+    throw new GQueryApiError(
+      `Values.append(${sheetName})`,
+      null,
+      `Sheet "${sheetName}" not found or has no header row.`,
+    );
   }
 
   const headers = response.values[0].map((header) => String(header));
@@ -78,29 +85,45 @@ export function appendInternal<
     });
   });
 
-  // Append data using Sheets API
-  const appendResponse = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.append(
-      { values: rowsToAppend },
-      spreadsheetId,
-      sheetName,
-      {
-        valueInputOption: "USER_ENTERED",
-        insertDataOption: "OVERWRITE",
-        responseValueRenderOption: "FORMATTED_VALUE",
-        responseDateTimeRenderOption: "FORMATTED_STRING",
-        includeValuesInResponse: true,
-      },
-    ),
-  );
+  let appendResponse: GoogleAppsScript.Sheets.Schema.AppendValuesResponse;
+  try {
+    appendResponse = callHandler(
+      () =>
+        Sheets!.Spreadsheets!.Values!.append(
+          { values: rowsToAppend },
+          spreadsheetId,
+          sheetName,
+          {
+            valueInputOption: "USER_ENTERED",
+            insertDataOption: "OVERWRITE",
+            responseValueRenderOption: "FORMATTED_VALUE",
+            responseDateTimeRenderOption: "FORMATTED_STRING",
+            includeValuesInResponse: true,
+          },
+        ),
+      20,
+      { operation: `Values.append(${sheetName})` },
+    );
+  } catch (error) {
+    if (error instanceof GQueryApiError) throw error;
+    throw new GQueryApiError(
+      `Values.append(${sheetName})`,
+      null,
+      `Failed to append ${rowsToAppend.length} row(s) to "${sheetName}".`,
+      error,
+    );
+  }
 
-  // Validate append was successful
   if (
     !appendResponse ||
     !appendResponse.updates ||
     !appendResponse.updates.updatedRange
   ) {
-    throw new Error("Failed to append data to sheet");
+    throw new GQueryApiError(
+      `Values.append(${sheetName})`,
+      null,
+      `Append response missing updatedRange. Payload size: ${rowsToAppend.length} rows × ${headers.length} cols.`,
+    );
   }
 
   // Parse the updated range to get row numbers
@@ -108,13 +131,16 @@ export function appendInternal<
   const rangeMatch = updatedRange.match(/([^!]+)!([A-Z]+)(\d+):([A-Z]+)(\d+)/);
 
   if (!rangeMatch) {
-    throw new Error(`Could not parse updated range: ${updatedRange}`);
+    throw new GQueryApiError(
+      `Values.append(${sheetName})`,
+      null,
+      `Could not parse updated range: ${updatedRange}`,
+    );
   }
 
   const startRow = parseInt(rangeMatch[3], 10);
   const endRow = parseInt(rangeMatch[5], 10);
 
-  // Validate that all rows were appended
   const expectedRowCount = data.length;
   const actualRowCount = endRow - startRow + 1;
   if (actualRowCount !== expectedRowCount) {
@@ -122,6 +148,8 @@ export function appendInternal<
       `Expected to append ${expectedRowCount} rows but ${actualRowCount} were appended`,
     );
   }
+
+  cache?.invalidate(sheetName);
 
   // Create result rows with metadata, typed to T
   const resultRows: GQueryRow<T>[] = rowsToAppend.map((row, index) => {
@@ -131,12 +159,9 @@ export function appendInternal<
         colLength: headers.length,
       },
     };
-
-    // Map values back to header names
     headers.forEach((header, colIndex) => {
       rowObj[header] = row[colIndex];
     });
-
     return rowObj as GQueryRow<T>;
   });
 

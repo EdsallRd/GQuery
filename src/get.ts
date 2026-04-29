@@ -1,15 +1,25 @@
 import { GQuery, GQueryTable, GQueryTableFactory } from "./index";
 import { callHandler } from "./ratelimit";
 import {
+  DateTimeRenderOption,
+  GQueryApiError,
   GQueryReadOptions,
   GQueryResult,
   GQueryRow,
   GQuerySchemaError,
+  GQueryWhereExpr,
   StandardSchemaV1,
   ValueRenderOption,
-  DateTimeRenderOption,
 } from "./types";
-import { normalizeForSchema, parseRows } from "./utils";
+import {
+  buildA1Range,
+  decodeCellValue,
+  normalizeForSchema,
+  parseRows,
+} from "./utils";
+
+const DATE_PATTERN =
+  /^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/;
 
 /**
  * Validate a single row through a Standard Schema.
@@ -52,65 +62,6 @@ function applySchemaToRows<T>(
   });
 }
 
-/**
- * Convert row values to appropriate types (boolean, date, number)
- * Optimized to reduce redundant type checking
- */
-function convertRowTypes(row: GQueryRow, headers: string[]): GQueryRow {
-  const newRow: GQueryRow = { __meta: row.__meta };
-
-  headers.forEach((header) => {
-    let value = row[header];
-
-    // Skip empty values
-    if (value === undefined || value === null || value === "") {
-      newRow[header] = value;
-      return;
-    }
-
-    // Only process string values for type conversion
-    if (typeof value === "string") {
-      const lowerValue = value.toLowerCase();
-
-      // Check for boolean
-      if (lowerValue === "true" || lowerValue === "false") {
-        newRow[header] = lowerValue === "true";
-        return;
-      }
-
-      // Check for date pattern (MM/DD/YYYY or MM/DD/YYYY HH:MM:SS)
-      if (
-        /^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(value)
-      ) {
-        const dateValue = new Date(value);
-        if (!isNaN(dateValue.getTime())) {
-          newRow[header] = dateValue;
-          return;
-        }
-      }
-
-      // Try to parse JSON objects/arrays
-      const trimmed = value.trim();
-      if (
-        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-        (trimmed.startsWith("[") && trimmed.endsWith("]"))
-      ) {
-        try {
-          newRow[header] = JSON.parse(trimmed);
-          return;
-        } catch {
-          // not valid JSON
-        }
-      }
-    }
-
-    // Keep original value if no conversion applied
-    newRow[header] = value;
-  });
-
-  return newRow;
-}
-
 export function getManyInternal(
   GQuery: GQuery,
   sheetNames: string[],
@@ -127,26 +78,49 @@ export function getManyInternal(
   const dateTimeRenderOption =
     options?.dateTimeRenderOption || DateTimeRenderOption.FORMATTED_STRING;
 
-  const result: { [sheetName: string]: GQueryResult } = {};
+  const cache = options?.cache === false ? null : GQuery.cache;
+  const cacheKeyOpts = {
+    range: "all",
+    valueRender: valueRenderOption,
+    dateRender: dateTimeRenderOption,
+  };
 
-  // Fetch data using batchGet for better performance
-  const dataResponse = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
-      ranges: sheetNames,
-      valueRenderOption,
-      dateTimeRenderOption,
-    }),
+  const result: { [sheetName: string]: GQueryResult } = {};
+  const sheetsToFetch: string[] = [];
+
+  for (const sheetName of sheetNames) {
+    if (cache?.enabled) {
+      const hit = cache.get(sheetName, cacheKeyOpts);
+      if (hit) {
+        result[sheetName] = hit;
+        continue;
+      }
+    }
+    sheetsToFetch.push(sheetName);
+  }
+
+  if (sheetsToFetch.length === 0) return result;
+
+  const dataResponse = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
+        ranges: sheetsToFetch,
+        valueRenderOption,
+        dateTimeRenderOption,
+      }),
+    20,
+    { operation: `Values.batchGet(${sheetsToFetch.join(",")})` },
   );
 
   if (!dataResponse || !dataResponse.valueRanges) {
-    sheetNames.forEach((sheet) => {
+    sheetsToFetch.forEach((sheet) => {
       result[sheet] = { headers: [], rows: [] };
     });
     return result;
   }
 
   dataResponse.valueRanges.forEach((valueRange, index) => {
-    const sheetName = sheetNames[index];
+    const sheetName = sheetsToFetch[index];
 
     if (!valueRange.values || valueRange.values.length === 0) {
       result[sheetName] = { headers: [], rows: [] };
@@ -154,12 +128,12 @@ export function getManyInternal(
     }
 
     const headers = valueRange.values[0].map((h) => String(h));
-    let rows = parseRows(headers, valueRange.values.slice(1));
-
-    // Apply type conversion to rows
-    rows = rows.map((row) => convertRowTypes(row, headers));
-
+    const rows = parseRows(headers, valueRange.values.slice(1));
     result[sheetName] = { headers, rows };
+
+    if (cache?.enabled) {
+      cache.put(sheetName, result[sheetName], cacheKeyOpts);
+    }
   });
 
   return result;
@@ -173,6 +147,31 @@ export function getInternal<
 ): GQueryResult<T> {
   const GQueryTable = GQueryTableFactory.GQueryTable;
   const GQuery = GQueryTable.GQuery;
+
+  // Server-side filter pushdown: when whereExpr is set and there are no
+  // joins, dispatch through the gviz/tq path so only matching rows come
+  // over the wire.
+  if (
+    GQueryTableFactory.whereExprOption &&
+    GQueryTableFactory.joinOption.length === 0
+  ) {
+    const tq = compileWhereExpr(
+      GQueryTableFactory.whereExprOption,
+      GQueryTableFactory.selectOption,
+      GQueryTableFactory.limitOption,
+      GQueryTableFactory.offsetOption,
+    );
+    const result = queryInternal(GQueryTable, tq, options);
+    const rows = GQueryTableFactory.filterOption
+      ? result.rows.filter((row) => safeFilter(GQueryTableFactory.filterOption!, row))
+      : result.rows;
+    const typed =
+      GQueryTable.schema && options?.validate
+        ? applySchemaToRows(GQueryTable.schema, rows)
+        : (rows as unknown as GQueryRow<T>[]);
+    return { headers: result.headers, rows: typed };
+  }
+
   // Determine which sheets we need to read from
   const sheetsToRead = [GQueryTable.sheetName];
 
@@ -208,38 +207,24 @@ export function getInternal<
         joinConfig;
 
       const joinData = results[sheetName];
+      if (!joinData || !joinData.rows || joinData.rows.length === 0) return;
 
-      if (!joinData || !joinData.rows || joinData.rows.length === 0) {
-        return; // Skip this join
-      }
-
-      // Create join lookup table
-      const joinMap: Record<string, any[]> = {};
-
-      // Check if the join column exists in the join table
       const joinHeaders = joinData.headers;
-      if (!joinHeaders.includes(sheetColumn)) {
-        return; // Skip this join
-      }
+      if (!joinHeaders.includes(sheetColumn)) return;
 
+      const joinMap: Record<string, GQueryRow[]> = {};
       joinData.rows.forEach((joinRow) => {
         const joinKey = String(joinRow[sheetColumn]);
-        if (!joinMap[joinKey]) {
-          joinMap[joinKey] = [];
-        }
+        if (!joinMap[joinKey]) joinMap[joinKey] = [];
         joinMap[joinKey].push(joinRow);
       });
 
-      // Perform the join operation
       rows = rows.map((row) => {
         const localJoinValue = row[joinColumn];
         const joinedRows = joinMap[String(localJoinValue)] || [];
-
-        // Create joined row with all join table fields
         const joinedRow = { ...row };
 
         joinedRows.forEach((joinRow, index) => {
-          // Determine which columns to include from join
           const columnsToInclude =
             columnsToReturn ||
             Object.keys(joinRow).filter(
@@ -247,8 +232,7 @@ export function getInternal<
             );
 
           columnsToInclude.forEach((key) => {
-            if (joinRow.hasOwnProperty(key) && key !== "__meta") {
-              // For multiple joined rows, add suffix _1, _2, etc.
+            if (Object.prototype.hasOwnProperty.call(joinRow, key) && key !== "__meta") {
               const suffix = joinedRows.length > 1 ? `_${index + 1}` : "";
               const targetKey = key === sheetColumn ? key : `${key}${suffix}`;
               joinedRow[targetKey] = joinRow[key];
@@ -263,185 +247,278 @@ export function getInternal<
 
   // Apply filter if specified
   if (GQueryTableFactory.filterOption) {
-    rows = rows.filter(GQueryTableFactory.filterOption);
+    rows = rows.filter((row) =>
+      safeFilter(GQueryTableFactory.filterOption!, row),
+    );
   }
 
-  // Apply select if specified
+  // Apply offset/limit (in-memory; A1-range pushdown happens earlier when no joins/filters require full data)
+  if (GQueryTableFactory.offsetOption !== undefined) {
+    rows = rows.slice(GQueryTableFactory.offsetOption);
+  }
+  if (GQueryTableFactory.limitOption !== undefined) {
+    rows = rows.slice(0, GQueryTableFactory.limitOption);
+  }
+
+  // Apply select if specified — strict projection. Joined columns are kept
+  // only when explicitly listed (or via .includeJoinColumns()).
+  let outHeaders = headers;
   if (
     GQueryTableFactory.selectOption &&
     GQueryTableFactory.selectOption.length > 0
   ) {
-    // Create a map to track columns from joined tables
-    const joinedColumns = new Set<string>();
+    let selectedHeaders = [...GQueryTableFactory.selectOption];
 
-    // Collect all columns from joined tables
-    rows.forEach((row) => {
-      Object.keys(row).forEach((key) => {
-        // If the column is not in the original headers, it's from a join
-        if (!headers.includes(key) && key !== "__meta") {
-          joinedColumns.add(key);
-        }
+    if (GQueryTableFactory.includeJoinColumnsOption) {
+      const joinedColumns = new Set<string>();
+      rows.forEach((row) => {
+        Object.keys(row).forEach((key) => {
+          if (!headers.includes(key) && key !== "__meta") {
+            joinedColumns.add(key);
+          }
+        });
       });
-    });
-
-    // If we have a select option, determine which columns to keep
-    let selectedHeaders: string[];
-
-    // Check if any of the selected headers is "Model" or "Model_Name"
-    // If we're selecting the join columns, we want to include all related joined fields
-    if (
-      GQueryTableFactory.selectOption.some(
-        (header) =>
-          header === "Model" ||
-          header === "Model_Name" ||
-          GQueryTableFactory.joinOption.some(
-            (j) => j.joinColumn === header || j.sheetColumn === header,
-          ),
-      )
-    ) {
-      // Include all join-related columns and the selected columns
-      selectedHeaders = [...GQueryTableFactory.selectOption];
-      joinedColumns.forEach((joinCol) => {
-        selectedHeaders.push(joinCol);
-      });
-    } else {
-      // Otherwise only include explicitly selected columns
-      selectedHeaders = [...GQueryTableFactory.selectOption];
+      joinedColumns.forEach((c) => selectedHeaders.push(c));
     }
 
-    // Remove duplicates
-    selectedHeaders = [...new Set(selectedHeaders)];
+    selectedHeaders = Array.from(new Set(selectedHeaders));
 
-    // Filter rows to only include selected columns
     rows = rows.map((row) => {
-      const selectedRow: GQueryRow = {
-        __meta: row.__meta,
-      };
-
+      const selectedRow: GQueryRow = { __meta: row.__meta };
       selectedHeaders.forEach((header) => {
-        if (row.hasOwnProperty(header)) {
+        if (Object.prototype.hasOwnProperty.call(row, header)) {
           selectedRow[header] = row[header];
         }
       });
-
       return selectedRow;
     });
-
-    // Apply schema validation if requested
-    const typedRows =
-      GQueryTable.schema && options?.validate
-        ? applySchemaToRows(GQueryTable.schema, rows)
-        : (rows as unknown as GQueryRow<T>[]);
-
-    return {
-      headers: selectedHeaders,
-      rows: typedRows,
-    };
+    outHeaders = selectedHeaders;
   }
 
-  // Apply schema validation if requested
   const typedRows =
     GQueryTable.schema && options?.validate
       ? applySchemaToRows(GQueryTable.schema, rows)
       : (rows as unknown as GQueryRow<T>[]);
 
   return {
-    headers,
+    headers: outHeaders,
     rows: typedRows,
   };
 }
 
+function safeFilter(
+  fn: (row: any) => boolean,
+  row: GQueryRow,
+): boolean {
+  try {
+    return fn(row);
+  } catch (error) {
+    console.error("Error filtering row:", error);
+    return false;
+  }
+}
+
+/**
+ * Execute a Google Visualization API (gviz/tq) query against the table's
+ * sheet. The caller passes in a fully-formed `tq` query string; we handle
+ * the column-name → A1-letter substitution by reading the header row once
+ * (cached when the spreadsheet's GQueryCache is enabled), wrap the HTTP
+ * call in callHandler for retries, and parse the response into typed rows.
+ */
 export function queryInternal(
   GQueryTable: GQueryTable,
   query: string,
+  options?: GQueryReadOptions,
 ): GQueryResult {
-  const sheet = GQueryTable.sheet;
-  const range = sheet.getDataRange();
+  const cache =
+    options?.cache === false ? null : GQueryTable.GQuery.cache;
 
-  // Build column name to letter mapping
-  let replaced = query;
-  const lastColumn = range.getLastColumn();
-
-  for (let i = 0; i < lastColumn; i++) {
-    const rng = sheet.getRange(1, i + 1);
-    const name = rng.getValue();
-    const letter = rng.getA1Notation().match(/([A-Z]+)/)?.[0];
-
-    if (letter && name) {
-      replaced = replaced.replaceAll(name, letter);
-    }
+  if (cache?.enabled) {
+    const hit = cache.getQuery(GQueryTable.sheetName, query);
+    if (hit) return hit;
   }
 
-  // Build query URL
+  const headers = readHeadersOnce(GQueryTable);
+
+  // Build column name → A1 letter map in a single pass over the header row.
+  let replaced = query;
+  for (let i = 0; i < headers.length; i++) {
+    const name = headers[i];
+    if (!name) continue;
+    const letter = columnLetterOf(i);
+    // Replace whole-word column references; most user queries quote names
+    // with backticks but we keep the legacy global-replace for compatibility.
+    replaced = replaced.split(name).join(letter);
+  }
+
   const url = Utilities.formatString(
-    "https://docs.google.com/spreadsheets/d/%s/gviz/tq?tq=%s&sheet=%s%s&headers=1",
-    sheet.getParent().getId(),
+    "https://docs.google.com/spreadsheets/d/%s/gviz/tq?tq=%s&sheet=%s&headers=1",
+    GQueryTable.spreadsheetId,
     encodeURIComponent(replaced),
-    sheet.getName(),
-    typeof range === "string" ? "&range=" + range : "",
+    encodeURIComponent(GQueryTable.sheetName),
   );
 
-  // Fetch with authorization
-  const response = UrlFetchApp.fetch(url, {
-    headers: {
-      Authorization: "Bearer " + ScriptApp.getOAuthToken(),
-    },
-  });
-
-  // Parse response
-  const jsonResponse = JSON.parse(
-    response
-      .getContentText()
-      .replace("/*O_o*/\n", "")
-      .replace(/(google\.visualization\.Query\.setResponse\()|(\);)/gm, ""),
+  const response = callHandler(
+    () =>
+      UrlFetchApp.fetch(url, {
+        muteHttpExceptions: true,
+        headers: {
+          Authorization: "Bearer " + ScriptApp.getOAuthToken(),
+        },
+      }),
+    20,
+    { urlFetch: true, operation: `gviz.query(${GQueryTable.sheetName})` },
   );
+
+  const body = response.getContentText();
+  const stripped = body
+    .replace("/*O_o*/\n", "")
+    .replace(/(google\.visualization\.Query\.setResponse\()|(\);)/gm, "");
+
+  let jsonResponse: any;
+  try {
+    jsonResponse = JSON.parse(stripped);
+  } catch (error) {
+    throw new GQueryApiError(
+      `gviz.query(${GQueryTable.sheetName})`,
+      response.getResponseCode(),
+      `Failed to parse gviz response: ${stripped.slice(0, 200)}`,
+      error,
+    );
+  }
+
+  if (jsonResponse.status === "error") {
+    const message = (jsonResponse.errors || [])
+      .map((e: any) => e.detailed_message || e.message)
+      .join("; ");
+    throw new GQueryApiError(
+      `gviz.query(${GQueryTable.sheetName})`,
+      response.getResponseCode(),
+      message || "gviz returned an error status",
+    );
+  }
 
   const table = jsonResponse.table;
+  const outHeaders: string[] = table.cols.map(
+    (col: any) => col.label || col.id || "",
+  );
 
-  // Extract column headers
-  const headers = table.cols.map((col: any) => col.label);
-
-  // Map rows to proper GQueryRow format
-  const rows = table.rows.map((row: any) => {
+  const rows: GQueryRow[] = table.rows.map((row: any) => {
     const rowObj: GQueryRow = {
       __meta: {
-        rowNum: -1, // Query results don't have reliable row numbers
+        rowNum: -1, // gviz doesn't expose source row numbers without __ROW__
         colLength: row.c.length,
       },
     };
-
-    // Populate row data
     table.cols.forEach((col: any, colIndex: number) => {
       const cellData = row.c[colIndex];
       let value: any = "";
-
       if (cellData) {
-        // Use formatted value if available, otherwise use raw value
         value =
           cellData.f !== null && cellData.f !== undefined
             ? cellData.f
             : cellData.v;
-
-        // Convert date strings if needed
-        if (
-          typeof value === "string" &&
-          /^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(value)
-        ) {
+        if (typeof value === "string" && DATE_PATTERN.test(value)) {
           const dateValue = new Date(value);
-          if (!isNaN(dateValue.getTime())) {
-            value = dateValue;
-          }
+          if (!isNaN(dateValue.getTime())) value = dateValue;
+        } else if (typeof value === "string") {
+          value = decodeCellValue(value);
         }
       }
-
-      rowObj[col.label] = value;
+      rowObj[outHeaders[colIndex] || col.id] = value;
     });
-
     return rowObj;
   });
 
-  return {
-    headers,
-    rows,
-  };
+  const out = { headers: outHeaders, rows };
+
+  if (cache?.enabled) {
+    cache.putQuery(GQueryTable.sheetName, query, out);
+  }
+  return out;
+}
+
+/**
+ * Read the header row for a sheet. Uses the GQueryCache when available
+ * (avoids the per-call Sheets RPC); otherwise issues a single
+ * `Values.get(sheet!1:1)` instead of the legacy per-column getRange loop.
+ */
+function readHeadersOnce(GQueryTable: GQueryTable): string[] {
+  const cache = GQueryTable.GQuery.cache;
+  if (cache?.enabled) {
+    const hit = cache.get(GQueryTable.sheetName, {
+      range: "all",
+      valueRender: "FORMATTED_VALUE",
+      dateRender: "FORMATTED_STRING",
+    });
+    if (hit) return hit.headers;
+  }
+  const range = buildA1Range(GQueryTable.sheetName, { offset: 0, limit: 0 });
+  const response = callHandler(
+    () => Sheets!.Spreadsheets!.Values!.get(GQueryTable.spreadsheetId, range),
+    20,
+    { operation: `Values.get(${range})` },
+  );
+  const values = response.values || [];
+  if (values.length === 0) return [];
+  return values[0].map((h: any) => String(h));
+}
+
+function columnLetterOf(index: number): string {
+  let out = "";
+  let n = index;
+  while (n >= 0) {
+    out = String.fromCharCode(65 + (n % 26)) + out;
+    n = Math.floor(n / 26) - 1;
+  }
+  return out;
+}
+
+/**
+ * Compile a typed GQueryWhereExpr into a Google Visualization API query
+ * string. Column names are emitted as backtick-quoted identifiers so they
+ * survive the later name → letter substitution step.
+ */
+export function compileWhereExpr(
+  expr: GQueryWhereExpr,
+  select?: string[],
+  limit?: number,
+  offset?: number,
+): string {
+  const parts: string[] = [];
+  if (select && select.length > 0) {
+    parts.push(`select ${select.map((c) => `\`${c}\``).join(", ")}`);
+  } else {
+    parts.push("select *");
+  }
+  parts.push(`where ${compileExpr(expr)}`);
+  if (limit !== undefined) parts.push(`limit ${limit}`);
+  if (offset !== undefined) parts.push(`offset ${offset}`);
+  return parts.join(" ");
+}
+
+function compileExpr(expr: GQueryWhereExpr): string {
+  if ("and" in expr) {
+    return `(${expr.and.map(compileExpr).join(" and ")})`;
+  }
+  if ("or" in expr) {
+    return `(${expr.or.map(compileExpr).join(" or ")})`;
+  }
+  if ("not" in expr) {
+    return `(not ${compileExpr(expr.not)})`;
+  }
+  const { col, op, value } = expr;
+  return `\`${col}\` ${op} ${formatLiteral(value)}`;
+}
+
+function formatLiteral(
+  value: string | number | boolean | null | Date,
+): string {
+  if (value === null) return "null";
+  if (value instanceof Date) {
+    return `date '${value.toISOString().slice(0, 10)}'`;
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return String(value);
+  return `"${String(value).replace(/"/g, '\\"')}"`;
 }

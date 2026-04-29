@@ -1,8 +1,12 @@
 /**
- * Exponential backoff handler for Google Sheets API calls
- * Handles rate limiting (429) and quota exceeded errors
- * @param fn Function to execute with retry logic
- * @param retries Maximum number of retry attempts (default: 20)
- * @returns Result of the function execution
+ * Exponential-backoff handler for Google Sheets API calls.
+ *
+ * Retries on rate-limit / quota errors thrown by the Advanced Sheets service.
+ * `urlFetch: true` adds support for `UrlFetchApp.fetch` results: response
+ * codes 429/5xx are converted into retries; other non-2xx responses are
+ * surfaced as `GQueryApiError`.
  */
-export declare function callHandler<T>(fn: () => T, retries?: number): T;
+export declare function callHandler<T>(fn: () => T, retries?: number, options?: {
+    urlFetch?: boolean;
+    operation?: string;
+}): T;

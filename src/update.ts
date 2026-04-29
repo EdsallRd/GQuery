@@ -1,12 +1,18 @@
 import { GQueryTableFactory } from "./index";
 import { callHandler } from "./ratelimit";
 import {
+  GQueryApiError,
   GQueryResult,
   GQueryRow,
   GQuerySchemaError,
   StandardSchemaV1,
 } from "./types";
-import { encodeCellValue, fetchSheetData, normalizeForSchema } from "./utils";
+import {
+  columnLetter,
+  encodeCellValue,
+  fetchSheetData,
+  normalizeForSchema,
+} from "./utils";
 
 /**
  * Validate a single row through a Standard Schema, preserving __meta.
@@ -42,9 +48,9 @@ export function updateInternal<
   const spreadsheetId = GQueryTableFactory.GQueryTable.spreadsheetId;
   const sheetName = GQueryTableFactory.GQueryTable.sheetName;
   const schema = GQueryTableFactory.GQueryTable.schema;
-  const range = sheetName;
+  const cache = GQueryTableFactory.GQueryTable.GQuery.cache;
 
-  const { headers, rows } = fetchSheetData(spreadsheetId, range);
+  const { headers, rows } = fetchSheetData(spreadsheetId, sheetName, cache);
 
   if (headers.length === 0) {
     return { rows: [], headers: [] };
@@ -82,28 +88,24 @@ export function updateInternal<
   updatedRows.forEach((updatedRow) => {
     const rowIndex = updatedRow.__meta.rowNum - 2;
     const originalRow = rows[rowIndex];
+    if (!originalRow) return;
 
     headers.forEach((header, columnIndex) => {
       const originalValue = encodeCellValue(originalRow[header]);
-      let updatedValue = encodeCellValue(updatedRow[header]);
+      const updatedValue = encodeCellValue(updatedRow[header]);
 
-      // Skip if values are the same
       if (originalValue === updatedValue) return;
 
-      // Only update if value changed or is being set/cleared
-      if (updatedValue !== undefined && updatedValue !== null) {
-        const columnLetter = getColumnLetter(columnIndex);
-        const cellRange = `${sheetName}!${columnLetter}${updatedRow.__meta.rowNum}`;
-        changedCells.set(cellRange, [[updatedValue]]);
-      } else if (originalValue !== undefined && originalValue !== null) {
-        const columnLetter = getColumnLetter(columnIndex);
-        const cellRange = `${sheetName}!${columnLetter}${updatedRow.__meta.rowNum}`;
-        changedCells.set(cellRange, [[updatedValue || ""]]);
-      }
+      const letter = columnLetter(columnIndex);
+      const cellRange = `${sheetName}!${letter}${updatedRow.__meta.rowNum}`;
+      const writeValue =
+        updatedValue !== undefined && updatedValue !== null
+          ? updatedValue
+          : "";
+      changedCells.set(cellRange, [[writeValue]]);
     });
   });
 
-  // Perform batch update if there are changes
   if (changedCells.size > 0) {
     const optimizedUpdates = optimizeRanges(changedCells);
 
@@ -112,12 +114,27 @@ export function updateInternal<
       valueInputOption: "USER_ENTERED",
     };
 
-    callHandler(() =>
-      Sheets!.Spreadsheets!.Values!.batchUpdate(
-        batchUpdateRequest,
-        spreadsheetId,
-      ),
-    );
+    try {
+      callHandler(
+        () =>
+          Sheets!.Spreadsheets!.Values!.batchUpdate(
+            batchUpdateRequest,
+            spreadsheetId,
+          ),
+        20,
+        { operation: `Values.batchUpdate(${sheetName})` },
+      );
+    } catch (error) {
+      if (error instanceof GQueryApiError) throw error;
+      throw new GQueryApiError(
+        `Values.batchUpdate(${sheetName})`,
+        null,
+        `Failed to update ${changedCells.size} cell(s) across ${optimizedUpdates.length} range(s).`,
+        error,
+      );
+    }
+
+    cache?.invalidate(sheetName);
   }
 
   // Apply schema validation if a schema is attached
@@ -129,21 +146,6 @@ export function updateInternal<
     rows: filteredRows.length > 0 ? typedRows : [],
     headers,
   };
-}
-
-/**
- * Convert column index to column letter (0 -> A, 1 -> B, etc.)
- */
-function getColumnLetter(columnIndex: number): string {
-  let columnLetter = "";
-  let index = columnIndex;
-
-  while (index >= 0) {
-    columnLetter = String.fromCharCode(65 + (index % 26)) + columnLetter;
-    index = Math.floor(index / 26) - 1;
-  }
-
-  return columnLetter;
 }
 
 /**
@@ -160,9 +162,9 @@ function optimizeRanges(
     if (!matches) continue;
 
     const sheet = matches[1];
-    const columnLetter = matches[2];
+    const col = matches[2];
     const rowNumber = parseInt(matches[3], 10);
-    const columnKey = `${sheet}!${columnLetter}`;
+    const columnKey = `${sheet}!${col}`;
 
     if (!columnGroups.has(columnKey)) {
       columnGroups.set(columnKey, new Map());
@@ -176,7 +178,7 @@ function optimizeRanges(
     const rowNumbers = Array.from(rowsMap.keys()).sort((a, b) => a - b);
     if (rowNumbers.length === 0) continue;
 
-    const [sheet, column] = columnKey.split("!");
+    const [sheet, col] = columnKey.split("!");
 
     let start = rowNumbers[0];
     let groupValues: any[][] = [[rowsMap.get(start)]];
@@ -190,8 +192,8 @@ function optimizeRanges(
         const end = prev;
         const rangeKey =
           start === end
-            ? `${sheet}!${column}${start}`
-            : `${sheet}!${column}${start}:${column}${end}`;
+            ? `${sheet}!${col}${start}`
+            : `${sheet}!${col}${start}:${col}${end}`;
         optimizedUpdates.push({ range: rangeKey, values: groupValues });
         start = rowNum;
         groupValues = [[rowsMap.get(rowNum)]];
@@ -201,8 +203,8 @@ function optimizeRanges(
     const last = rowNumbers[rowNumbers.length - 1];
     const rangeKey =
       start === last
-        ? `${sheet}!${column}${start}`
-        : `${sheet}!${column}${start}:${column}${last}`;
+        ? `${sheet}!${col}${start}`
+        : `${sheet}!${col}${start}:${col}${last}`;
     optimizedUpdates.push({ range: rangeKey, values: groupValues });
   }
 

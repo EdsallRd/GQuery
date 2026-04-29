@@ -12,6 +12,9 @@ Yet another Google Sheets ORM for Apps Script, supporting advanced features like
   - [Type Inference Only](#type-inference-only)
   - [Runtime Validation](#runtime-validation)
   - [Handling Validation Errors](#handling-validation-errors)
+- [Caching with CacheService](#caching-with-cacheservice)
+- [Server-Side Filters and Pagination](#server-side-filters-and-pagination)
+- [Migrating from v1 to v2](#migrating-from-v1-to-v2)
 - [Usage](#usage)
   - [Using GET](#using-get)
   - [Using GET MANY](#using-get-many)
@@ -37,7 +40,7 @@ To use GQuery, you must first enable the Google Sheets API in your Apps Script p
 If you use a build toolchain in your Apps Script project, like Rollup or Vite, this is the preferred installation method.
 
 - To install via the command line: `pnpm add @edsallrd/gquery` (or `npm install @edsallrd/gquery`)
-- To add in your `package.json` dependencies: `"@edsallrd/gquery": "^1.5.3"`
+- To add in your `package.json` dependencies: `"@edsallrd/gquery": "^2.0.0"`
 - Inside the [Yggdrasil](#working-in-yggdrasil) workspace, use `"@edsallrd/gquery": "workspace:*"` to consume the local source.
 
 You'll call the GQuery class via `new GQuery()`
@@ -148,6 +151,70 @@ try {
   }
 }
 ```
+
+---
+
+## Caching with CacheService
+
+GQuery v2 ships with a built-in cache layer backed by Apps Script's [`CacheService`](https://developers.google.com/apps-script/reference/cache/cache-service). Reads are cached by default; writes (`update`, `append`, `delete`) automatically invalidate the affected sheet.
+
+Defaults:
+
+| Setting             | Default              | Notes                                                              |
+| ------------------- | -------------------- | ------------------------------------------------------------------ |
+| Scope               | `document`           | One cache per spreadsheet — change with `scope: "script" \| "user"` |
+| Header TTL          | 3600s (1 hour)       | Headers rarely change                                              |
+| Data TTL            | 600s (10 minutes)    | Row data — adjust per workload                                     |
+| Query TTL           | 300s (5 minutes)     | Results from `.query()` / `.whereExpr()`                           |
+| Chunk size          | 50 rows              | Splits payloads to stay under the 100KB CacheService limit          |
+| Compression         | gzip ≥ 50KB          | Automatic; falls back to raw + warning if a chunk still overflows  |
+
+```typescript
+// Defaults are sensible for most cases — just construct as usual.
+const gq = new GQuery("your-spreadsheet-id");
+
+// Override per-instance:
+const gq = new GQuery("your-spreadsheet-id", {
+  cache: { ttl: { data: 60 }, scope: "user" },
+});
+
+// Disable caching entirely on this instance:
+const gq = new GQuery("your-spreadsheet-id", { cache: false });
+
+// Or per-call:
+gq.from("Sheet1").get({ cache: false });
+
+// Manually invalidate:
+gq.invalidateCache("Sheet1");
+```
+
+## Server-Side Filters and Pagination
+
+`.where()` runs in-memory after the fetch. For large sheets, push the filter to Google's servers with `.whereExpr()` — the predicate is compiled to a Google Visualization API query, so only matching rows come over the wire. Joins are not supported in this mode.
+
+```typescript
+const gq = new GQuery();
+const adults = gq
+  .from<{ Name: string; Age: number }>("People")
+  .whereExpr({ col: "Age", op: ">=", value: 18 })
+  .limit(100)
+  .get();
+```
+
+`GQueryWhereExpr` supports `=`, `!=`, `<`, `<=`, `>`, `>=`, `contains`, `starts with`, `ends with`, `matches`, plus `{ and: [...] }`, `{ or: [...] }`, and `{ not: ... }`.
+
+`.limit(n)` and `.offset(n)` work on any chain. When combined with `.whereExpr()` they're emitted directly into the gviz query.
+
+## Migrating from v1 to v2
+
+| Change | Action |
+| --- | --- |
+| Caching is now default-on | Pass `{ cache: false }` to the constructor or per-call to opt out. |
+| `.select()` no longer auto-includes joined columns when "Model" / "Model_Name" appear | List joined columns explicitly, or chain `.includeJoinColumns()` to keep the legacy behavior. |
+| Failed API calls throw `GQueryApiError` (extends `Error`) | Catch `GQueryApiError` for typed access to `operation`, `status`, and `body`. |
+| `.query()` rate-limit retries | The HTTP fetch is now wrapped in the same retry policy as the Sheets API. No code changes needed. |
+| Removed redundant JSON parsing on read | Boolean / date / JSON conversion happens in a single pass. Behavior is unchanged for valid data. |
+| Spreadsheet & sheet handles are memoized on `GQuery` | Multiple `from()` calls reuse one `openById` result. No code changes needed. |
 
 ---
 
