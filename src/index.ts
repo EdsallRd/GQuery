@@ -2,6 +2,7 @@ import { getInternal, getManyInternal, queryInternal } from "./get";
 import { updateInternal } from "./update";
 import { appendInternal, appendOneInternal } from "./append";
 import { deleteInternal } from "./delete";
+import { readThrough, invalidateSheet, type CacheOptions } from "./cache";
 import {
   GQueryReadOptions,
   GQueryResult,
@@ -9,6 +10,8 @@ import {
   InferSchema,
   StandardSchemaV1,
 } from "./types";
+
+export type { CacheOptions };
 
 export * from "./types";
 
@@ -101,6 +104,8 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   sheet: GoogleAppsScript.Spreadsheet.Sheet;
   /** The Standard Schema used for type inference and optional runtime validation */
   schema?: StandardSchemaV1<unknown, T>;
+  /** Cache options set by .cached() — undefined means no caching */
+  private cacheOpts?: CacheOptions;
 
   constructor(
     GQuery: GQuery,
@@ -187,12 +192,28 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   }
 
   /**
+   * Enable server-side caching for this read via CacheService.
+   * Subsequent `.get()` calls will serve from cache on hit and populate the cache
+   * on miss. Writes (append/appendOne/update/delete) on the same sheet
+   * automatically invalidate the cache — no manual `.invalidate()` needed.
+   *
+   * @param opts Optional cache configuration (key, ttl, bypass)
+   * @returns this (for chaining)
+   */
+  cached(opts?: CacheOptions): this {
+    this.cacheOpts = opts ?? {};
+    return this;
+  }
+
+  /**
    * Update rows in the sheet
    * @param updateFn Function that receives a typed row and returns updated values
    * @returns GQueryResult with updated rows
    */
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {
-    return new GQueryTableFactory<T>(this).update(updateFn);
+    const result = new GQueryTableFactory<T>(this).update(updateFn);
+    invalidateSheet(this.sheetName);
+    return result;
   }
 
   /**
@@ -208,7 +229,9 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
     options?: Pick<GQueryReadOptions, "validate">,
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
-    return appendInternal<T>(this, dataArray, options);
+    const result = appendInternal<T>(this, dataArray, options);
+    invalidateSheet(this.sheetName);
+    return result;
   }
 
   /**
@@ -218,7 +241,9 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    * @returns The inserted row with __meta populated
    */
   appendOne(row: T, options?: Pick<GQueryReadOptions, "validate">): GQueryRow<T> {
-    return appendOneInternal<T>(this, row, options);
+    const result = appendOneInternal<T>(this, row, options);
+    invalidateSheet(this.sheetName);
+    return result;
   }
 
   /**
@@ -227,7 +252,11 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    * @returns GQueryResult with rows typed to T
    */
   get(options?: GQueryReadOptions): GQueryResult<T> {
-    return new GQueryTableFactory<T>(this).get(options);
+    const factory = new GQueryTableFactory<T>(this);
+    if (this.cacheOpts !== undefined) {
+      factory.cacheOpts = this.cacheOpts;
+    }
+    return factory.get(options);
   }
 
   /**
@@ -279,7 +308,9 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    * @returns Object with count of deleted rows
    */
   delete(): { deletedRows: number } {
-    return new GQueryTableFactory<T>(this).delete();
+    const result = new GQueryTableFactory<T>(this).delete();
+    invalidateSheet(this.sheetName);
+    return result;
   }
 }
 
@@ -303,6 +334,8 @@ export class GQueryTableFactory<
   orderByState?: { field: string; direction: "asc" | "desc" };
   limitState?: number;
   offsetState?: number;
+  /** Cache options set by .cached() — undefined means no caching */
+  cacheOpts?: CacheOptions;
 
   constructor(GQueryTable: GQueryTable<T>) {
     this.GQueryTable = GQueryTable;
@@ -348,12 +381,33 @@ export class GQueryTableFactory<
     return this;
   }
 
-  get(options?: GQueryReadOptions): GQueryResult<T> {
+  /**
+   * Enable server-side caching for this read via CacheService.
+   * @param opts Optional cache configuration (key, ttl, bypass)
+   * @returns this (for chaining)
+   */
+  cached(opts?: CacheOptions): this {
+    this.cacheOpts = opts ?? {};
+    return this;
+  }
+
+  private uncachedGet(options?: GQueryReadOptions): GQueryResult<T> {
     return getInternal<T>(this, options, this.orderByState, this.limitState, this.offsetState);
   }
 
+  get(options?: GQueryReadOptions): GQueryResult<T> {
+    if (this.cacheOpts !== undefined) {
+      return readThrough(this.cacheOpts, this.GQueryTable.sheetName, () =>
+        this.uncachedGet(options),
+      );
+    }
+    return this.uncachedGet(options);
+  }
+
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {
-    return updateInternal<T>(this, updateFn);
+    const result = updateInternal<T>(this, updateFn);
+    invalidateSheet(this.GQueryTable.sheetName);
+    return result;
   }
 
   append(
@@ -361,10 +415,14 @@ export class GQueryTableFactory<
     options?: Pick<GQueryReadOptions, "validate">,
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
-    return appendInternal<T>(this.GQueryTable, dataArray, options);
+    const result = appendInternal<T>(this.GQueryTable, dataArray, options);
+    invalidateSheet(this.GQueryTable.sheetName);
+    return result;
   }
 
   delete(): { deletedRows: number } {
-    return deleteInternal(this);
+    const result = deleteInternal(this);
+    invalidateSheet(this.GQueryTable.sheetName);
+    return result;
   }
 }
