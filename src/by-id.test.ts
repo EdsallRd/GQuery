@@ -11,8 +11,16 @@ describe("byId shortcuts", () => {
       }),
     });
 
-    vi.spyOn(Sheets.Spreadsheets.Values, "batchGet").mockReturnValue({
-      valueRanges: [{ values: [["id", "name"], ["1", "Alice"], ["2", "Bob"]] }],
+    vi.spyOn(Sheets!.Spreadsheets.Values, "batchGet").mockReturnValue({
+      valueRanges: [
+        {
+          values: [
+            ["id", "name"],
+            ["1", "Alice"],
+            ["2", "Bob"],
+          ],
+        },
+      ],
     } as any);
   });
 
@@ -29,14 +37,20 @@ describe("byId shortcuts", () => {
   });
 
   it("updateById applies the mutator and writes via batchUpdate", () => {
-    vi.spyOn(Sheets.Spreadsheets.Values, "get").mockReturnValue({
-      values: [["id", "name"], ["1", "Alice"], ["2", "Bob"]],
+    vi.spyOn(Sheets!.Spreadsheets.Values, "get").mockReturnValue({
+      values: [
+        ["id", "name"],
+        ["1", "Alice"],
+        ["2", "Bob"],
+      ],
     } as any);
     const batchUpdate = vi
-      .spyOn(Sheets.Spreadsheets.Values, "batchUpdate")
+      .spyOn(Sheets!.Spreadsheets.Values, "batchUpdate")
       .mockReturnValue({} as any);
     const gq = new GQuery();
-    gq.from("Sheet1").updateById("2", (r) => { (r as any).name = "Robert"; });
+    gq.from("Sheet1").updateById("2", (r) => {
+      (r as any).name = "Robert";
+    });
     expect(batchUpdate).toHaveBeenCalledTimes(1);
     // Verify the mutator's value reached the API call:
     const callArgs = batchUpdate.mock.calls[0];
@@ -45,11 +59,15 @@ describe("byId shortcuts", () => {
   });
 
   it("deleteById issues a deleteDimension batchUpdate", () => {
-    vi.spyOn(Sheets.Spreadsheets.Values, "get").mockReturnValue({
-      values: [["id", "name"], ["1", "Alice"], ["2", "Bob"]],
+    vi.spyOn(Sheets!.Spreadsheets.Values, "get").mockReturnValue({
+      values: [
+        ["id", "name"],
+        ["1", "Alice"],
+        ["2", "Bob"],
+      ],
     } as any);
     const batchUpdate = vi
-      .spyOn(Sheets.Spreadsheets, "batchUpdate")
+      .spyOn(Sheets!.Spreadsheets, "batchUpdate")
       .mockReturnValue({} as any);
     const gq = new GQuery();
     gq.from("Sheet1").deleteById("1");

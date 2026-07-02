@@ -11,21 +11,27 @@ describe("orderBy", () => {
       }),
     });
 
-    vi.spyOn(Sheets.Spreadsheets.Values, "batchGet").mockReturnValue({
-      valueRanges: [{
-        values: [
-          ["id", "name", "age"],
-          ["1", "Charlie", "30"],
-          ["2", "Alice", "25"],
-          ["3", "Bob", "35"],
-        ],
-      }],
+    vi.spyOn(Sheets!.Spreadsheets.Values, "batchGet").mockReturnValue({
+      valueRanges: [
+        {
+          values: [
+            ["id", "name", "age"],
+            ["1", "Charlie", "30"],
+            ["2", "Alice", "25"],
+            ["3", "Bob", "35"],
+          ],
+        },
+      ],
     } as any);
   });
 
   it("sorts ascending by string field", () => {
     const result = new GQuery().from("Sheet1").orderBy("name", "asc").get();
-    expect(result.rows.map((r: any) => r.name)).toEqual(["Alice", "Bob", "Charlie"]);
+    expect(result.rows.map((r: any) => r.name)).toEqual([
+      "Alice",
+      "Bob",
+      "Charlie",
+    ]);
   });
 
   it("sorts descending by numeric field", () => {
@@ -35,6 +41,10 @@ describe("orderBy", () => {
 
   it("default direction is asc", () => {
     const result = new GQuery().from("Sheet1").orderBy("name").get();
-    expect(result.rows.map((r: any) => r.name)).toEqual(["Alice", "Bob", "Charlie"]);
+    expect(result.rows.map((r: any) => r.name)).toEqual([
+      "Alice",
+      "Bob",
+      "Charlie",
+    ]);
   });
 });

@@ -11,10 +11,10 @@ describe("appendOne", () => {
       }),
     });
 
-    vi.spyOn(Sheets.Spreadsheets.Values, "get").mockReturnValue({
+    vi.spyOn(Sheets!.Spreadsheets.Values, "get").mockReturnValue({
       values: [["id", "name"]],
     } as any);
-    vi.spyOn(Sheets.Spreadsheets.Values, "append").mockReturnValue({
+    vi.spyOn(Sheets!.Spreadsheets.Values, "append").mockReturnValue({
       updates: { updatedRange: "Sheet1!A2:B2" },
     } as any);
   });

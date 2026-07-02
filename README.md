@@ -36,9 +36,8 @@ To use GQuery, you must first enable the Google Sheets API in your Apps Script p
 
 If you use a build toolchain in your Apps Script project, like Rollup or Vite, this is the preferred installation method.
 
-- To install via the command line: `pnpm add @edsallrd/gquery` (or `npm install @edsallrd/gquery`)
+- To install via the command line: `npm add @edsallrd/gquery`
 - To add in your `package.json` dependencies: `"@edsallrd/gquery": "^1.5.3"`
-- Inside the [Yggdrasil](#working-in-yggdrasil) workspace, use `"@edsallrd/gquery": "workspace:*"` to consume the local source.
 
 You'll call the GQuery class via `new GQuery()`
 
@@ -360,11 +359,3 @@ The QUERY method is especially fast for large spreadsheets, as it leverages Goog
 | -------------- | :---------: | :----------------: |
 | GET            |   7890ms    |       8199ms       |
 | QUERY          |   7844ms    |       1821ms       |
-
-## Working in Yggdrasil
-
-This repository is a child of the [Yggdrasil](https://github.com/EdsallRd) meta-repo, which orchestrates Edsall Park projects via pnpm workspaces. When developing inside Yggdrasil:
-
-- Sibling apps depend on this package via `"@edsallrd/gquery": "workspace:*"` — pnpm resolves to the local checkout, so changes here are picked up immediately.
-- Build the bundle with `pnpm --filter @edsallrd/gquery build` from the workspace root, or `pnpm build` from this directory.
-- This package is its own git repository. Commit changes here, not at the meta-repo level.

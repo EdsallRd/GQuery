@@ -162,6 +162,32 @@ function fetchSheetData(spreadsheetId, sheetName) {
 }
 
 /**
+ * Apply offset and limit to a row array. Returns a new array (or the original if both are absent).
+ */
+function paginateRows(rows, offset, limit) {
+    if (typeof offset === "number" && offset > 0) {
+        rows = rows.slice(offset);
+    }
+    if (typeof limit === "number" && limit >= 0) {
+        rows = rows.slice(0, limit);
+    }
+    return rows;
+}
+/**
+ * Sort rows by a single field. Returns the input array unchanged if no orderBy is provided.
+ * The comparator uses `<`/`>` so it works for both numbers and lexically-comparable strings.
+ */
+function sortRows(rows, orderBy) {
+    if (!orderBy)
+        return rows;
+    return [...rows].sort((a, b) => {
+        const av = a[orderBy.field];
+        const bv = b[orderBy.field];
+        const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+        return orderBy.direction === "desc" ? -cmp : cmp;
+    });
+}
+/**
  * Validate a single row through a Standard Schema.
  * Throws GQuerySchemaError if validation fails.
  * Throws a plain Error if the schema returns a Promise (async schemas are not
@@ -269,7 +295,7 @@ function getManyInternal(GQuery, sheetNames, options) {
     });
     return result;
 }
-function getInternal(GQueryTableFactory, options) {
+function getInternal(GQueryTableFactory, options, orderBy, limit, offset) {
     const GQueryTable = GQueryTableFactory.GQueryTable;
     const GQuery = GQueryTable.GQuery;
     // Determine which sheets we need to read from
@@ -342,7 +368,9 @@ function getInternal(GQueryTableFactory, options) {
     if (GQueryTableFactory.filterOption) {
         rows = rows.filter(GQueryTableFactory.filterOption);
     }
-    // Apply select if specified
+    // Apply select if specified — narrows columns and shifts the effective `headers`
+    // we return. Sort/paginate/validate run once below regardless of branch.
+    let outputHeaders = headers;
     if (GQueryTableFactory.selectOption &&
         GQueryTableFactory.selectOption.length > 0) {
         // Create a map to track columns from joined tables
@@ -387,21 +415,17 @@ function getInternal(GQueryTableFactory, options) {
             });
             return selectedRow;
         });
-        // Apply schema validation if requested
-        const typedRows = GQueryTable.schema && (options === null || options === void 0 ? void 0 : options.validate)
-            ? applySchemaToRows(GQueryTable.schema, rows)
-            : rows;
-        return {
-            headers: selectedHeaders,
-            rows: typedRows,
-        };
+        outputHeaders = selectedHeaders;
     }
+    // Apply sort then pagination if specified — single call site for both branches
+    rows = sortRows(rows, orderBy);
+    rows = paginateRows(rows, offset, limit);
     // Apply schema validation if requested
     const typedRows = GQueryTable.schema && (options === null || options === void 0 ? void 0 : options.validate)
         ? applySchemaToRows(GQueryTable.schema, rows)
         : rows;
     return {
-        headers,
+        headers: outputHeaders,
         rows: typedRows,
     };
 }
@@ -719,6 +743,20 @@ function appendInternal(table, data, options) {
         headers,
     };
 }
+/**
+ * Append a single row and return it directly (not wrapped in a GQueryResult).
+ * @param table The GQueryTable to append to
+ * @param row Object to append
+ * @param options Optional validation flag
+ * @returns The inserted row with __meta populated
+ */
+function appendOneInternal(table, row, options) {
+    const result = appendInternal(table, [row], options);
+    if (result.rows.length === 0) {
+        throw new Error(`appendOne: append succeeded but returned no rows`);
+    }
+    return result.rows[0];
+}
 
 function deleteInternal(GQueryTableFactory) {
     const spreadsheetId = GQueryTableFactory.GQueryTable.spreadsheetId;
@@ -767,6 +805,70 @@ function deleteInternal(GQueryTableFactory) {
         console.error("Error deleting rows:", error);
         throw new Error(`Failed to delete rows: ${error}`);
     }
+}
+
+const KEY_INDEX_KEY = "gq:__keys__";
+function defaultKey(sheetName) {
+    return `gq:${sheetName}:list`;
+}
+function readThrough(opts, sheetName, producer) {
+    var _a, _b;
+    const cache = CacheService.getScriptCache();
+    const key = (_a = opts === null || opts === void 0 ? void 0 : opts.key) !== null && _a !== void 0 ? _a : defaultKey(sheetName);
+    if (!(opts === null || opts === void 0 ? void 0 : opts.bypass)) {
+        const hit = cache.get(key);
+        if (hit !== null) {
+            try {
+                return JSON.parse(hit);
+            }
+            catch { /* fall through to producer */ }
+        }
+    }
+    const value = producer();
+    try {
+        const serialized = JSON.stringify(value);
+        if (serialized.length <= 100000) {
+            cache.put(key, serialized, (_b = opts === null || opts === void 0 ? void 0 : opts.ttl) !== null && _b !== void 0 ? _b : 300);
+            trackKey(key);
+        }
+    }
+    catch {
+        /* serialization failure — return value but don't cache */
+    }
+    return value;
+}
+function invalidateSheet(sheetName) {
+    const cache = CacheService.getScriptCache();
+    // Default key
+    cache.remove(defaultKey(sheetName));
+    // Any tracked custom keys for this sheet
+    const tracked = readKeyIndex();
+    const prefix = `gq:${sheetName}:`;
+    const toRemove = tracked.filter((k) => k.startsWith(prefix));
+    if (toRemove.length > 0) {
+        cache.removeAll(toRemove);
+        writeKeyIndex(tracked.filter((k) => !toRemove.includes(k)));
+    }
+}
+function trackKey(key) {
+    const existing = readKeyIndex();
+    if (!existing.includes(key)) {
+        writeKeyIndex([...existing, key]);
+    }
+}
+function readKeyIndex() {
+    const raw = CacheService.getScriptCache().get(KEY_INDEX_KEY);
+    if (!raw)
+        return [];
+    try {
+        return JSON.parse(raw);
+    }
+    catch {
+        return [];
+    }
+}
+function writeKeyIndex(keys) {
+    CacheService.getScriptCache().put(KEY_INDEX_KEY, JSON.stringify(keys), 21600);
 }
 
 /**
@@ -828,6 +930,31 @@ class GQueryTable {
         return new GQueryTableFactory(this).where(filterFn);
     }
     /**
+     * Sort rows by a field before returning
+     * @param field Column name to sort by
+     * @param direction Sort direction: "asc" (default) or "desc"
+     * @returns GQueryTableFactory for chaining
+     */
+    orderBy(field, direction = "asc") {
+        return new GQueryTableFactory(this).orderBy(field, direction);
+    }
+    /**
+     * Limit the number of rows returned.
+     * @param n Maximum number of rows
+     * @returns GQueryTableFactory for chaining
+     */
+    limit(n) {
+        return new GQueryTableFactory(this).limit(n);
+    }
+    /**
+     * Skip the first N rows before returning.
+     * @param n Number of rows to skip
+     * @returns GQueryTableFactory for chaining
+     */
+    offset(n) {
+        return new GQueryTableFactory(this).offset(n);
+    }
+    /**
      * Join with another sheet.
      * Note: joined columns are typed as additional `any` fields alongside T.
      *
@@ -841,12 +968,27 @@ class GQueryTable {
         return new GQueryTableFactory(this).join(sheetName, sheetColumn, joinColumn, columnsToReturn);
     }
     /**
+     * Enable server-side caching for this read via CacheService.
+     * Subsequent `.get()` calls will serve from cache on hit and populate the cache
+     * on miss. Writes (append/appendOne/update/delete) on the same sheet
+     * automatically invalidate the cache — no manual `.invalidate()` needed.
+     *
+     * @param opts Optional cache configuration (key, ttl, bypass)
+     * @returns this (for chaining)
+     */
+    cached(opts) {
+        this.cacheOpts = opts !== null && opts !== void 0 ? opts : {};
+        return this;
+    }
+    /**
      * Update rows in the sheet
      * @param updateFn Function that receives a typed row and returns updated values
      * @returns GQueryResult with updated rows
      */
     update(updateFn) {
-        return new GQueryTableFactory(this).update(updateFn);
+        const result = new GQueryTableFactory(this).update(updateFn);
+        invalidateSheet(this.sheetName);
+        return result;
     }
     /**
      * Append new rows to the sheet.
@@ -858,7 +1000,20 @@ class GQueryTable {
      */
     append(data, options) {
         const dataArray = Array.isArray(data) ? data : [data];
-        return appendInternal(this, dataArray, options);
+        const result = appendInternal(this, dataArray, options);
+        invalidateSheet(this.sheetName);
+        return result;
+    }
+    /**
+     * Append a single row and return the inserted row directly (not wrapped in a result).
+     * @param row Object to append
+     * @param options Optional validation flag
+     * @returns The inserted row with __meta populated
+     */
+    appendOne(row, options) {
+        const result = appendOneInternal(this, row, options);
+        invalidateSheet(this.sheetName);
+        return result;
     }
     /**
      * Get data from the sheet
@@ -866,7 +1021,40 @@ class GQueryTable {
      * @returns GQueryResult with rows typed to T
      */
     get(options) {
-        return new GQueryTableFactory(this).get(options);
+        const factory = new GQueryTableFactory(this);
+        if (this.cacheOpts !== undefined) {
+            factory.cacheOpts = this.cacheOpts;
+        }
+        return factory.get(options);
+    }
+    /**
+     * Get a single row by its `id` field.
+     * @param id Value of the row's `id` field
+     * @returns The matching row, or undefined if no row matches
+     */
+    getById(id) {
+        const result = this.where((row) => row.id === id).get();
+        return result.rows[0];
+    }
+    /**
+     * Update a single row identified by its `id` field.
+     * The mutator may either mutate the row in place or return a Partial<T> — both styles are handled.
+     * @param id Value of the row's `id` field
+     * @param mutator Function that mutates the row in place or returns updated field values
+     */
+    updateById(id, mutator) {
+        this.where((row) => row.id === id).update((row) => {
+            const copy = { ...row };
+            const returned = mutator(copy);
+            return returned !== undefined ? returned : copy;
+        });
+    }
+    /**
+     * Delete a single row identified by its `id` field.
+     * @param id Value of the row's `id` field
+     */
+    deleteById(id) {
+        this.where((row) => row.id === id).delete();
     }
     /**
      * Execute a Google Visualization API query
@@ -881,7 +1069,9 @@ class GQueryTable {
      * @returns Object with count of deleted rows
      */
     delete() {
-        return new GQueryTableFactory(this).delete();
+        const result = new GQueryTableFactory(this).delete();
+        invalidateSheet(this.sheetName);
+        return result;
     }
 }
 /**
@@ -901,6 +1091,18 @@ class GQueryTableFactory {
         this.filterOption = filterFn;
         return this;
     }
+    orderBy(field, direction = "asc") {
+        this.orderByState = { field, direction };
+        return this;
+    }
+    limit(n) {
+        this.limitState = n;
+        return this;
+    }
+    offset(n) {
+        this.offsetState = n;
+        return this;
+    }
     join(sheetName, sheetColumn, joinColumn, columnsToReturn) {
         this.joinOption.push({
             sheetName,
@@ -910,18 +1112,39 @@ class GQueryTableFactory {
         });
         return this;
     }
+    /**
+     * Enable server-side caching for this read via CacheService.
+     * @param opts Optional cache configuration (key, ttl, bypass)
+     * @returns this (for chaining)
+     */
+    cached(opts) {
+        this.cacheOpts = opts !== null && opts !== void 0 ? opts : {};
+        return this;
+    }
+    uncachedGet(options) {
+        return getInternal(this, options, this.orderByState, this.limitState, this.offsetState);
+    }
     get(options) {
-        return getInternal(this, options);
+        if (this.cacheOpts !== undefined) {
+            return readThrough(this.cacheOpts, this.GQueryTable.sheetName, () => this.uncachedGet(options));
+        }
+        return this.uncachedGet(options);
     }
     update(updateFn) {
-        return updateInternal(this, updateFn);
+        const result = updateInternal(this, updateFn);
+        invalidateSheet(this.GQueryTable.sheetName);
+        return result;
     }
     append(data, options) {
         const dataArray = Array.isArray(data) ? data : [data];
-        return appendInternal(this.GQueryTable, dataArray, options);
+        const result = appendInternal(this.GQueryTable, dataArray, options);
+        invalidateSheet(this.GQueryTable.sheetName);
+        return result;
     }
     delete() {
-        return deleteInternal(this);
+        const result = deleteInternal(this);
+        invalidateSheet(this.GQueryTable.sheetName);
+        return result;
     }
 }
 

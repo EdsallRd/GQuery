@@ -11,13 +11,15 @@ describe("limit/offset", () => {
       }),
     });
 
-    vi.spyOn(Sheets.Spreadsheets.Values, "batchGet").mockReturnValue({
-      valueRanges: [{
-        values: [
-          ["id"],
-          ...Array.from({ length: 50 }, (_, i) => [String(i + 1)]),
-        ],
-      }],
+    vi.spyOn(Sheets!.Spreadsheets.Values, "batchGet").mockReturnValue({
+      valueRanges: [
+        {
+          values: [
+            ["id"],
+            ...Array.from({ length: 50 }, (_, i) => [String(i + 1)]),
+          ],
+        },
+      ],
     } as any);
   });
 
@@ -34,7 +36,11 @@ describe("limit/offset", () => {
   });
 
   it("limit applies after orderBy", () => {
-    const result = new GQuery().from("Sheet1").orderBy("id", "desc").limit(3).get();
+    const result = new GQuery()
+      .from("Sheet1")
+      .orderBy("id", "desc")
+      .limit(3)
+      .get();
     // String sort descending: "9" > "8" > "7" > "50" > ... (single-char digits sort after "5x")
     expect(result.rows.map((r: any) => r.id)).toEqual(["9", "8", "7"]);
   });

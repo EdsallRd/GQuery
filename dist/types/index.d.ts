@@ -1,4 +1,6 @@
+import { type CacheOptions } from "./cache";
 import { GQueryReadOptions, GQueryResult, GQueryRow, InferSchema, StandardSchemaV1 } from "./types";
+export type { CacheOptions };
 export * from "./types";
 /**
  * Main GQuery class for interacting with Google Sheets
@@ -58,6 +60,8 @@ export declare class GQueryTable<T extends Record<string, any> = Record<string, 
     sheet: GoogleAppsScript.Spreadsheet.Sheet;
     /** The Standard Schema used for type inference and optional runtime validation */
     schema?: StandardSchemaV1<unknown, T>;
+    /** Cache options set by .cached() — undefined means no caching */
+    private cacheOpts?;
     constructor(GQuery: GQuery, spreadsheetId: string, sheetName: string, schema?: StandardSchemaV1<unknown, T>);
     /**
      * Select specific columns to return
@@ -72,6 +76,25 @@ export declare class GQueryTable<T extends Record<string, any> = Record<string, 
      */
     where(filterFn: (row: GQueryRow<T>) => boolean): GQueryTableFactory<T>;
     /**
+     * Sort rows by a field before returning
+     * @param field Column name to sort by
+     * @param direction Sort direction: "asc" (default) or "desc"
+     * @returns GQueryTableFactory for chaining
+     */
+    orderBy(field: keyof T & string, direction?: "asc" | "desc"): GQueryTableFactory<T>;
+    /**
+     * Limit the number of rows returned.
+     * @param n Maximum number of rows
+     * @returns GQueryTableFactory for chaining
+     */
+    limit(n: number): GQueryTableFactory<T>;
+    /**
+     * Skip the first N rows before returning.
+     * @param n Number of rows to skip
+     * @returns GQueryTableFactory for chaining
+     */
+    offset(n: number): GQueryTableFactory<T>;
+    /**
      * Join with another sheet.
      * Note: joined columns are typed as additional `any` fields alongside T.
      *
@@ -82,6 +105,16 @@ export declare class GQueryTable<T extends Record<string, any> = Record<string, 
      * @returns GQueryTableFactory for chaining
      */
     join(sheetName: string, sheetColumn: string, joinColumn: string, columnsToReturn?: string[]): GQueryTableFactory<T>;
+    /**
+     * Enable server-side caching for this read via CacheService.
+     * Subsequent `.get()` calls will serve from cache on hit and populate the cache
+     * on miss. Writes (append/appendOne/update/delete) on the same sheet
+     * automatically invalidate the cache — no manual `.invalidate()` needed.
+     *
+     * @param opts Optional cache configuration (key, ttl, bypass)
+     * @returns this (for chaining)
+     */
+    cached(opts?: CacheOptions): this;
     /**
      * Update rows in the sheet
      * @param updateFn Function that receives a typed row and returns updated values
@@ -98,11 +131,42 @@ export declare class GQueryTable<T extends Record<string, any> = Record<string, 
      */
     append(data: T | T[], options?: Pick<GQueryReadOptions, "validate">): GQueryResult<T>;
     /**
+     * Append a single row and return the inserted row directly (not wrapped in a result).
+     * @param row Object to append
+     * @param options Optional validation flag
+     * @returns The inserted row with __meta populated
+     */
+    appendOne(row: T, options?: Pick<GQueryReadOptions, "validate">): GQueryRow<T>;
+    /**
      * Get data from the sheet
      * @param options Optional rendering and validation options
      * @returns GQueryResult with rows typed to T
      */
     get(options?: GQueryReadOptions): GQueryResult<T>;
+    /**
+     * Get a single row by its `id` field.
+     * @param id Value of the row's `id` field
+     * @returns The matching row, or undefined if no row matches
+     */
+    getById(id: T extends {
+        id: infer Id;
+    } ? Id : string | number): GQueryRow<T> | undefined;
+    /**
+     * Update a single row identified by its `id` field.
+     * The mutator may either mutate the row in place or return a Partial<T> — both styles are handled.
+     * @param id Value of the row's `id` field
+     * @param mutator Function that mutates the row in place or returns updated field values
+     */
+    updateById(id: T extends {
+        id: infer Id;
+    } ? Id : string | number, mutator: (row: T) => void | Partial<T>): void;
+    /**
+     * Delete a single row identified by its `id` field.
+     * @param id Value of the row's `id` field
+     */
+    deleteById(id: T extends {
+        id: infer Id;
+    } ? Id : string | number): void;
     /**
      * Execute a Google Visualization API query
      * @param query Query string in Google Query Language
@@ -132,10 +196,28 @@ export declare class GQueryTableFactory<T extends Record<string, any> = Record<s
         joinColumn: string;
         columnsToReturn?: string[];
     }[];
+    orderByState?: {
+        field: string;
+        direction: "asc" | "desc";
+    };
+    limitState?: number;
+    offsetState?: number;
+    /** Cache options set by .cached() — undefined means no caching */
+    cacheOpts?: CacheOptions;
     constructor(GQueryTable: GQueryTable<T>);
     select(headers: string[]): GQueryTableFactory<T>;
     where(filterFn: (row: GQueryRow<T>) => boolean): GQueryTableFactory<T>;
+    orderBy(field: keyof T & string, direction?: "asc" | "desc"): this;
+    limit(n: number): this;
+    offset(n: number): this;
     join(sheetName: string, sheetColumn: string, joinColumn: string, columnsToReturn?: string[]): GQueryTableFactory<T>;
+    /**
+     * Enable server-side caching for this read via CacheService.
+     * @param opts Optional cache configuration (key, ttl, bypass)
+     * @returns this (for chaining)
+     */
+    cached(opts?: CacheOptions): this;
+    private uncachedGet;
     get(options?: GQueryReadOptions): GQueryResult<T>;
     update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T>;
     append(data: T | T[], options?: Pick<GQueryReadOptions, "validate">): GQueryResult<T>;
