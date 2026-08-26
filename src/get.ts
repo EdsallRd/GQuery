@@ -9,6 +9,7 @@ import {
   ValueRenderOption,
   DateTimeRenderOption,
 } from "./types";
+import { convertRowTypes, normalizeForSchema, parseRows } from "./utils";
 import { normalizeForSchema, parseRows } from "./utils";
 import { sheetRange } from "./a1";
 
@@ -85,65 +86,6 @@ function applySchemaToRows<T>(
     const validated = applySchema(schema, normalizeForSchema(data));
     return { ...(validated as object), __meta } as GQueryRow<T>;
   });
-}
-
-/**
- * Convert row values to appropriate types (boolean, date, number)
- * Optimized to reduce redundant type checking
- */
-function convertRowTypes(row: GQueryRow, headers: string[]): GQueryRow {
-  const newRow: GQueryRow = { __meta: row.__meta };
-
-  headers.forEach((header) => {
-    let value = row[header];
-
-    // Skip empty values
-    if (value === undefined || value === null || value === "") {
-      newRow[header] = value;
-      return;
-    }
-
-    // Only process string values for type conversion
-    if (typeof value === "string") {
-      const lowerValue = value.toLowerCase();
-
-      // Check for boolean
-      if (lowerValue === "true" || lowerValue === "false") {
-        newRow[header] = lowerValue === "true";
-        return;
-      }
-
-      // Check for date pattern (MM/DD/YYYY or MM/DD/YYYY HH:MM:SS)
-      if (
-        /^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(value)
-      ) {
-        const dateValue = new Date(value);
-        if (!isNaN(dateValue.getTime())) {
-          newRow[header] = dateValue;
-          return;
-        }
-      }
-
-      // Try to parse JSON objects/arrays
-      const trimmed = value.trim();
-      if (
-        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-        (trimmed.startsWith("[") && trimmed.endsWith("]"))
-      ) {
-        try {
-          newRow[header] = JSON.parse(trimmed);
-          return;
-        } catch {
-          // not valid JSON
-        }
-      }
-    }
-
-    // Keep original value if no conversion applied
-    newRow[header] = value;
-  });
-
-  return newRow;
 }
 
 export function getManyInternal(
