@@ -19,6 +19,12 @@ export declare function normalizeForSchema(data: Record<string, any>): Record<st
  */
 export declare function parseRows(headers: string[], values: any[][]): GQueryRow[];
 /**
+ * Convert row values to appropriate types (boolean, date, number).
+ * FORMATTED_VALUE reads return checkbox/date cells as strings, so this keeps
+ * every read path (get, getMany, update, delete) consistent for `==` filters.
+ */
+export declare function convertRowTypes(row: GQueryRow, headers: string[]): GQueryRow;
+/**
  * Fetch all data from a sheet including headers
  * @param spreadsheetId The ID of the spreadsheet
  * @param sheetName The name of the sheet to fetch

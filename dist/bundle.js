@@ -145,6 +145,54 @@ function parseRows(headers, values) {
     });
 }
 /**
+ * Convert row values to appropriate types (boolean, date, number).
+ * FORMATTED_VALUE reads return checkbox/date cells as strings, so this keeps
+ * every read path (get, getMany, update, delete) consistent for `==` filters.
+ */
+function convertRowTypes(row, headers) {
+    const newRow = { __meta: row.__meta };
+    headers.forEach((header) => {
+        const value = row[header];
+        // Skip empty values
+        if (value === undefined || value === null || value === "") {
+            newRow[header] = value;
+            return;
+        }
+        // Only process string values for type conversion
+        if (typeof value === "string") {
+            const lowerValue = value.toLowerCase();
+            // Check for boolean
+            if (lowerValue === "true" || lowerValue === "false") {
+                newRow[header] = lowerValue === "true";
+                return;
+            }
+            // Check for date pattern (MM/DD/YYYY or MM/DD/YYYY HH:MM:SS)
+            if (/^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(value)) {
+                const dateValue = new Date(value);
+                if (!isNaN(dateValue.getTime())) {
+                    newRow[header] = dateValue;
+                    return;
+                }
+            }
+            // Try to parse JSON objects/arrays
+            const trimmed = value.trim();
+            if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+                (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+                try {
+                    newRow[header] = JSON.parse(trimmed);
+                    return;
+                }
+                catch {
+                    // not valid JSON
+                }
+            }
+        }
+        // Keep original value if no conversion applied
+        newRow[header] = value;
+    });
+    return newRow;
+}
+/**
  * Fetch all data from a sheet including headers
  * @param spreadsheetId The ID of the spreadsheet
  * @param sheetName The name of the sheet to fetch
@@ -157,7 +205,7 @@ function fetchSheetData(spreadsheetId, sheetName) {
         return { headers: [], rows: [] };
     }
     const headers = values[0].map((h) => String(h));
-    const rows = parseRows(headers, values.slice(1));
+    const rows = parseRows(headers, values.slice(1)).map((row) => convertRowTypes(row, headers));
     return { headers, rows };
 }
 
@@ -214,53 +262,6 @@ function applySchemaToRows(schema, rows) {
         const validated = applySchema$2(schema, normalizeForSchema(data));
         return { ...validated, __meta };
     });
-}
-/**
- * Convert row values to appropriate types (boolean, date, number)
- * Optimized to reduce redundant type checking
- */
-function convertRowTypes(row, headers) {
-    const newRow = { __meta: row.__meta };
-    headers.forEach((header) => {
-        let value = row[header];
-        // Skip empty values
-        if (value === undefined || value === null || value === "") {
-            newRow[header] = value;
-            return;
-        }
-        // Only process string values for type conversion
-        if (typeof value === "string") {
-            const lowerValue = value.toLowerCase();
-            // Check for boolean
-            if (lowerValue === "true" || lowerValue === "false") {
-                newRow[header] = lowerValue === "true";
-                return;
-            }
-            // Check for date pattern (MM/DD/YYYY or MM/DD/YYYY HH:MM:SS)
-            if (/^\d{1,2}\/\d{1,2}\/\d{4}(\s\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(value)) {
-                const dateValue = new Date(value);
-                if (!isNaN(dateValue.getTime())) {
-                    newRow[header] = dateValue;
-                    return;
-                }
-            }
-            // Try to parse JSON objects/arrays
-            const trimmed = value.trim();
-            if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-                (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
-                try {
-                    newRow[header] = JSON.parse(trimmed);
-                    return;
-                }
-                catch {
-                    // not valid JSON
-                }
-            }
-        }
-        // Keep original value if no conversion applied
-        newRow[header] = value;
-    });
-    return newRow;
 }
 function getManyInternal(GQuery, sheetNames, options) {
     if (!sheetNames || sheetNames.length === 0) {
