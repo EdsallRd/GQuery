@@ -26,4 +26,24 @@ describe("appendOne", () => {
     expect(Array.isArray(row)).toBe(false);
     expect(row).not.toHaveProperty("rows");
   });
+
+  it("quotes a sheet name containing spaces in both API calls", () => {
+    const get = vi.spyOn(Sheets!.Spreadsheets.Values, "get");
+    const append = vi
+      .spyOn(Sheets!.Spreadsheets.Values, "append")
+      .mockReturnValue({
+        updates: { updatedRange: "'QuickTicket Users'!A2:B2" },
+      } as any);
+
+    new GQuery().from("QuickTicket Users").appendOne({
+      id: "1",
+      name: "Alice",
+    });
+
+    expect(get).toHaveBeenLastCalledWith(
+      "test-spreadsheet",
+      "'QuickTicket Users'!1:1",
+    );
+    expect(append.mock.calls.at(-1)?.[2]).toBe("'QuickTicket Users'");
+  });
 });

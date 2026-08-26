@@ -83,4 +83,20 @@ describe("cached", () => {
     new GQuery().from("Sheet1").appendOne({ id: "3", name: "Carol" });
     expect(cache.remove).toHaveBeenCalledWith("gq:Sheet1:list");
   });
+
+  it("does not turn a committed write into a failure when invalidation throws", () => {
+    cache.remove.mockImplementation(() => {
+      throw new Error("Cache unavailable");
+    });
+    vi.spyOn(Sheets!.Spreadsheets.Values, "get").mockReturnValue({
+      values: [headerRow],
+    } as any);
+    vi.spyOn(Sheets!.Spreadsheets.Values, "append").mockReturnValue({
+      updates: { updatedRange: "Sheet1!A3:B3" },
+    } as any);
+
+    expect(() =>
+      new GQuery().from("Sheet1").appendOne({ id: "3", name: "Carol" }),
+    ).not.toThrow();
+  });
 });

@@ -1,14 +1,22 @@
-/**
- * Exponential backoff handler for Google Sheets API calls
- * Handles rate limiting (429) and quota exceeded errors
- * @param fn Function to execute with retry logic
- * @param retries Maximum number of retry attempts (default: 20)
- * @returns Result of the function execution
- */
-export function callHandler<T>(fn: () => T, retries: number = 20): T {
-  let attempt = 0;
+export const DEFAULT_RETRIES = 4;
+export const MAX_RETRIES = 6;
 
-  while (attempt < retries) {
+export function normalizeRetryCount(retries = DEFAULT_RETRIES): number {
+  if (!Number.isInteger(retries) || retries < 0 || retries > MAX_RETRIES) {
+    throw new RangeError(`GQuery retries must be an integer from 0 to ${MAX_RETRIES}.`);
+  }
+  return retries;
+}
+
+/**
+ * Run a Sheets API request with bounded exponential backoff for quota errors.
+ * `retries` counts retries after the initial request.
+ */
+export function callHandler<T>(fn: () => T, retries = DEFAULT_RETRIES): T {
+  const retryLimit = normalizeRetryCount(retries);
+  let retry = 0;
+
+  while (true) {
     try {
       return fn();
     } catch (error: any) {
@@ -21,22 +29,22 @@ export function callHandler<T>(fn: () => T, retries: number = 20): T {
         errorMessage.includes("Rate Limit Exceeded");
 
       if (isRateLimitError) {
-        attempt++;
-
-        if (attempt >= retries) {
+        if (retry >= retryLimit) {
           throw new Error(
-            `Max retries (${retries}) reached for Google Sheets API call. Last error: ${errorMessage}`,
+            `Max retries (${retryLimit}) reached for Google Sheets API call. Last error: ${errorMessage}`,
           );
         }
 
+        retry += 1;
+
         // Exponential backoff with jitter, capped at 64 seconds
         const backoffDelay = Math.min(
-          Math.pow(2, attempt) * 1000 + Math.random() * 1000,
+          Math.pow(2, retry) * 1000 + Math.random() * 1000,
           64000,
         );
 
         console.log(
-          `Rate limit hit, retrying in ${Math.round(backoffDelay)}ms (attempt ${attempt}/${retries})`,
+          `Rate limit hit, retrying in ${Math.round(backoffDelay)}ms (retry ${retry}/${retryLimit})`,
         );
         Utilities.sleep(backoffDelay);
       } else {
@@ -45,8 +53,4 @@ export function callHandler<T>(fn: () => T, retries: number = 20): T {
       }
     }
   }
-
-  throw new Error(
-    "Unexpected state: Max retries reached without throwing error",
-  );
 }

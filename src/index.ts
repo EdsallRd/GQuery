@@ -3,10 +3,27 @@ import { updateInternal } from "./update";
 import { appendInternal, appendOneInternal } from "./append";
 import { deleteInternal } from "./delete";
 import { readThrough, invalidateSheet, type CacheOptions } from "./cache";
+import { normalizeRetryCount } from "./ratelimit";
 import {
+  appendValuesInternal,
+  batchUpdateValuesInternal,
+  getValuesInternal,
+  updateValuesInternal,
+} from "./values";
+import {
+  GQueryAppendValuesOptions,
+  GQueryAppendValuesResult,
+  GQueryBatchUpdateValuesResult,
+  GQueryCellValue,
+  GQueryGetValuesOptions,
+  GQueryOptions,
   GQueryReadOptions,
   GQueryResult,
   GQueryRow,
+  GQueryUpdateValuesResult,
+  GQueryValueRangeInput,
+  GQueryValueRangeResult,
+  GQueryWriteValuesOptions,
   InferSchema,
   StandardSchemaV1,
 } from "./types";
@@ -14,6 +31,7 @@ import {
 export type { CacheOptions };
 
 export * from "./types";
+export * from "./a1";
 
 /**
  * Main GQuery class for interacting with Google Sheets
@@ -21,15 +39,51 @@ export * from "./types";
  */
 export class GQuery {
   spreadsheetId: string;
+  readonly retries: number;
 
   /**
    * Create a new GQuery instance
    * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
    */
-  constructor(spreadsheetId?: string) {
+  constructor(spreadsheetId?: string, options: GQueryOptions = {}) {
     this.spreadsheetId = spreadsheetId
       ? spreadsheetId
       : SpreadsheetApp.getActiveSpreadsheet().getId();
+    this.retries = normalizeRetryCount(options.retries);
+  }
+
+  /** Read one targeted A1 range without loading an entire sheet. */
+  getValues(
+    range: string,
+    options?: GQueryGetValuesOptions,
+  ): GQueryValueRangeResult {
+    return getValuesInternal(this, range, options);
+  }
+
+  /** Update one targeted A1 range and invalidate its sheet cache. */
+  updateValues(
+    range: string,
+    values: readonly (readonly GQueryCellValue[])[],
+    options?: GQueryWriteValuesOptions,
+  ): GQueryUpdateValuesResult {
+    return updateValuesInternal(this, range, values, options);
+  }
+
+  /** Atomically update several targeted A1 ranges. */
+  batchUpdateValues(
+    ranges: readonly GQueryValueRangeInput[],
+    options?: GQueryWriteValuesOptions,
+  ): GQueryBatchUpdateValuesResult {
+    return batchUpdateValuesInternal(this, ranges, options);
+  }
+
+  /** Append values to a targeted table range and return its updated range. */
+  appendValues(
+    range: string,
+    values: readonly (readonly GQueryCellValue[])[],
+    options?: GQueryAppendValuesOptions,
+  ): GQueryAppendValuesResult {
+    return appendValuesInternal(this, range, values, options);
   }
 
   /**

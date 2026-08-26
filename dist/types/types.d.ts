@@ -44,14 +44,69 @@ export declare namespace StandardSchemaV1 {
  * type Row = InferSchema<typeof schema>; // { name: string }
  */
 export type InferSchema<S> = S extends StandardSchemaV1<any, infer O> ? O : Record<string, unknown>;
+/** Options applied to every Sheets API call made by a GQuery instance. */
+export interface GQueryOptions {
+    /** Number of quota/rate-limit retries after the initial request (0-6). */
+    retries?: number;
+}
+export type GQueryMajorDimension = "ROWS" | "COLUMNS";
+export type GQueryValueRenderOption = "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA";
+export type GQueryDateTimeRenderOption = "SERIAL_NUMBER" | "FORMATTED_STRING";
+export type GQueryValueInputOption = "RAW" | "USER_ENTERED";
+export type GQueryInsertDataOption = "OVERWRITE" | "INSERT_ROWS";
+export type GQueryCellValue = string | number | boolean | null;
+export type GQueryValues = GQueryCellValue[][];
+export interface GQueryGetValuesOptions {
+    majorDimension?: GQueryMajorDimension;
+    valueRenderOption?: GQueryValueRenderOption;
+    dateTimeRenderOption?: GQueryDateTimeRenderOption;
+}
+export interface GQueryWriteValuesOptions {
+    valueInputOption?: GQueryValueInputOption;
+    includeValuesInResponse?: boolean;
+    responseValueRenderOption?: GQueryValueRenderOption;
+    responseDateTimeRenderOption?: GQueryDateTimeRenderOption;
+}
+export interface GQueryAppendValuesOptions extends GQueryWriteValuesOptions {
+    insertDataOption?: GQueryInsertDataOption;
+}
+export interface GQueryValueRangeInput {
+    range: string;
+    values: readonly (readonly GQueryCellValue[])[];
+    majorDimension?: GQueryMajorDimension;
+}
+export interface GQueryValueRangeResult {
+    range: string;
+    majorDimension: GQueryMajorDimension;
+    values: GQueryValues;
+}
+export interface GQueryUpdateValuesResult {
+    spreadsheetId: string;
+    updatedRange: string;
+    updatedRows: number;
+    updatedColumns: number;
+    updatedCells: number;
+    updatedData: GQueryValueRangeResult | null;
+}
+export interface GQueryBatchUpdateValuesResult {
+    spreadsheetId: string;
+    totalUpdatedRows: number;
+    totalUpdatedColumns: number;
+    totalUpdatedCells: number;
+    totalUpdatedSheets: number;
+    responses: GQueryUpdateValuesResult[];
+}
+export interface GQueryAppendValuesResult extends GQueryUpdateValuesResult {
+    tableRange: string | null;
+}
 /**
  * Options for reading data from Google Sheets
  */
 export type GQueryReadOptions = {
     /** How values should be rendered in the output */
-    valueRenderOption?: ValueRenderOption;
+    valueRenderOption?: ValueRenderOption | GQueryValueRenderOption;
     /** How dates and times should be rendered in the output */
-    dateTimeRenderOption?: DateTimeRenderOption;
+    dateTimeRenderOption?: DateTimeRenderOption | GQueryDateTimeRenderOption;
     /**
      * When true, each row is parsed through the table's schema (if set).
      * Throws a GQuerySchemaError if validation fails.

@@ -4,7 +4,7 @@ declare namespace GQuery {
       ttl?: number;
       bypass?: boolean;
   }
-  
+
   /**
    * Standard Schema V1 interface
    * @see https://standardschema.dev
@@ -51,14 +51,69 @@ declare namespace GQuery {
    * type Row = InferSchema<typeof schema>; // { name: string }
    */
   type InferSchema<S> = S extends StandardSchemaV1<any, infer O> ? O : Record<string, unknown>;
+  /** Options applied to every Sheets API call made by a GQuery instance. */
+  interface GQueryOptions {
+      /** Number of quota/rate-limit retries after the initial request (0-6). */
+      retries?: number;
+  }
+  type GQueryMajorDimension = "ROWS" | "COLUMNS";
+  type GQueryValueRenderOption = "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA";
+  type GQueryDateTimeRenderOption = "SERIAL_NUMBER" | "FORMATTED_STRING";
+  type GQueryValueInputOption = "RAW" | "USER_ENTERED";
+  type GQueryInsertDataOption = "OVERWRITE" | "INSERT_ROWS";
+  type GQueryCellValue = string | number | boolean | null;
+  type GQueryValues = GQueryCellValue[][];
+  interface GQueryGetValuesOptions {
+      majorDimension?: GQueryMajorDimension;
+      valueRenderOption?: GQueryValueRenderOption;
+      dateTimeRenderOption?: GQueryDateTimeRenderOption;
+  }
+  interface GQueryWriteValuesOptions {
+      valueInputOption?: GQueryValueInputOption;
+      includeValuesInResponse?: boolean;
+      responseValueRenderOption?: GQueryValueRenderOption;
+      responseDateTimeRenderOption?: GQueryDateTimeRenderOption;
+  }
+  interface GQueryAppendValuesOptions extends GQueryWriteValuesOptions {
+      insertDataOption?: GQueryInsertDataOption;
+  }
+  interface GQueryValueRangeInput {
+      range: string;
+      values: readonly (readonly GQueryCellValue[])[];
+      majorDimension?: GQueryMajorDimension;
+  }
+  interface GQueryValueRangeResult {
+      range: string;
+      majorDimension: GQueryMajorDimension;
+      values: GQueryValues;
+  }
+  interface GQueryUpdateValuesResult {
+      spreadsheetId: string;
+      updatedRange: string;
+      updatedRows: number;
+      updatedColumns: number;
+      updatedCells: number;
+      updatedData: GQueryValueRangeResult | null;
+  }
+  interface GQueryBatchUpdateValuesResult {
+      spreadsheetId: string;
+      totalUpdatedRows: number;
+      totalUpdatedColumns: number;
+      totalUpdatedCells: number;
+      totalUpdatedSheets: number;
+      responses: GQueryUpdateValuesResult[];
+  }
+  interface GQueryAppendValuesResult extends GQueryUpdateValuesResult {
+      tableRange: string | null;
+  }
   /**
    * Options for reading data from Google Sheets
    */
   type GQueryReadOptions = {
       /** How values should be rendered in the output */
-      valueRenderOption?: ValueRenderOption;
+      valueRenderOption?: ValueRenderOption | GQueryValueRenderOption;
       /** How dates and times should be rendered in the output */
-      dateTimeRenderOption?: DateTimeRenderOption;
+      dateTimeRenderOption?: DateTimeRenderOption | GQueryDateTimeRenderOption;
       /**
        * When true, each row is parsed through the table's schema (if set).
        * Throws a GQuerySchemaError if validation fails.
@@ -117,18 +172,34 @@ declare namespace GQuery {
       readonly row: Record<string, any>;
       constructor(issues: ReadonlyArray<StandardSchemaV1.Issue>, row: Record<string, any>);
   }
-  
+
+  /** Quote a sheet title for use in Google Sheets A1 notation. */
+  declare function quoteSheetName(sheetName: string): string;
+  /** Build an A1 range from a literal sheet title and an optional cell range. */
+  declare function sheetRange(sheetName: string, range?: string): string;
+  /** Extract a literal sheet title from a sheet-qualified A1 range. */
+  declare function sheetNameFromRange(range: string): string | null;
+
   /**
    * Main GQuery class for interacting with Google Sheets
    * Provides a query-like interface for reading and writing spreadsheet data
    */
   declare class GQuery {
       spreadsheetId: string;
+      readonly retries: number;
       /**
        * Create a new GQuery instance
        * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
        */
-      constructor(spreadsheetId?: string);
+      constructor(spreadsheetId?: string, options?: GQueryOptions);
+      /** Read one targeted A1 range without loading an entire sheet. */
+      getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
+      /** Update one targeted A1 range and invalidate its sheet cache. */
+      updateValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryWriteValuesOptions): GQueryUpdateValuesResult;
+      /** Atomically update several targeted A1 ranges. */
+      batchUpdateValues(ranges: readonly GQueryValueRangeInput[], options?: GQueryWriteValuesOptions): GQueryBatchUpdateValuesResult;
+      /** Append values to a targeted table range and return its updated range. */
+      appendValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryAppendValuesOptions): GQueryAppendValuesResult;
       /**
        * Get a typed table reference for a specific sheet using a Standard Schema.
        * The schema's output type flows through all subsequent operations.
@@ -341,9 +412,9 @@ declare namespace GQuery {
           deletedRows: number;
       };
   }
-  
-  export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption };
-  export type { CacheOptions, GQueryReadOptions, GQueryResult, GQueryRow, InferSchema };
-  
+
+  export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, quoteSheetName, sheetNameFromRange, sheetRange };
+  export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteValuesOptions, InferSchema };
+
 }
 declare var GQuery: typeof GQuery;

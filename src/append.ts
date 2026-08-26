@@ -8,6 +8,7 @@ import {
   StandardSchemaV1,
 } from "./types";
 import { encodeCellValue, normalizeForSchema } from "./utils";
+import { sheetRange } from "./a1";
 
 /**
  * Validate a single value through a Standard Schema.
@@ -48,6 +49,7 @@ export function appendInternal<
   const spreadsheetId = table.spreadsheetId;
   const sheetName = table.sheetName;
   const schema = table.schema;
+  const retries = table.GQuery.retries;
 
   // Validate each item through the schema before writing, if requested
   const validatedData: T[] =
@@ -58,8 +60,13 @@ export function appendInternal<
       : data;
 
   // Fetch headers from the first row
-  const response = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.get(spreadsheetId, `${sheetName}!1:1`),
+  const response = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.get(
+        spreadsheetId,
+        sheetRange(sheetName, "1:1"),
+      ),
+    retries,
   );
 
   // Validate sheet exists and has headers
@@ -79,19 +86,21 @@ export function appendInternal<
   });
 
   // Append data using Sheets API
-  const appendResponse = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.append(
-      { values: rowsToAppend },
-      spreadsheetId,
-      sheetName,
-      {
-        valueInputOption: "USER_ENTERED",
-        insertDataOption: "OVERWRITE",
-        responseValueRenderOption: "FORMATTED_VALUE",
-        responseDateTimeRenderOption: "FORMATTED_STRING",
-        includeValuesInResponse: true,
-      },
-    ),
+  const appendResponse = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.append(
+        { values: rowsToAppend },
+        spreadsheetId,
+        sheetRange(sheetName),
+        {
+          valueInputOption: "USER_ENTERED",
+          insertDataOption: "OVERWRITE",
+          responseValueRenderOption: "FORMATTED_VALUE",
+          responseDateTimeRenderOption: "FORMATTED_STRING",
+          includeValuesInResponse: true,
+        },
+      ),
+    retries,
   );
 
   // Validate append was successful
@@ -105,14 +114,14 @@ export function appendInternal<
 
   // Parse the updated range to get row numbers
   const updatedRange = appendResponse.updates.updatedRange;
-  const rangeMatch = updatedRange.match(/([^!]+)!([A-Z]+)(\d+):([A-Z]+)(\d+)/);
+  const rangeMatch = updatedRange.match(/!([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
 
   if (!rangeMatch) {
     throw new Error(`Could not parse updated range: ${updatedRange}`);
   }
 
-  const startRow = parseInt(rangeMatch[3], 10);
-  const endRow = parseInt(rangeMatch[5], 10);
+  const startRow = parseInt(rangeMatch[2], 10);
+  const endRow = parseInt(rangeMatch[4], 10);
 
   // Validate that all rows were appended
   const expectedRowCount = data.length;

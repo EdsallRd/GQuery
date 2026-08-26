@@ -9,8 +9,9 @@ export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
   const sheetName = GQueryTableFactory.GQueryTable.sheetName;
   const sheet = GQueryTableFactory.GQueryTable.sheet;
   const sheetId = sheet.getSheetId();
+  const retries = GQueryTableFactory.GQueryTable.GQuery.retries;
 
-  const { rows } = fetchSheetData(spreadsheetId, sheetName);
+  const { rows } = fetchSheetData(spreadsheetId, sheetName, retries);
 
   // Check if filter is specified and rows exist
   if (!GQueryTableFactory.filterOption || rows.length === 0) {
@@ -50,8 +51,10 @@ export function deleteInternal(GQueryTableFactory: GQueryTableFactory<any>): {
 
   // Execute batch delete
   try {
-    callHandler(() =>
-      Sheets!.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
+    callHandler(
+      () =>
+        Sheets!.Spreadsheets!.batchUpdate(batchUpdateRequest, spreadsheetId),
+      retries,
     );
     return { deletedRows: rowsToDelete.length };
   } catch (error) {

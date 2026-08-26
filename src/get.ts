@@ -10,6 +10,7 @@ import {
   DateTimeRenderOption,
 } from "./types";
 import { normalizeForSchema, parseRows } from "./utils";
+import { sheetRange } from "./a1";
 
 /**
  * Apply offset and limit to a row array. Returns a new array (or the original if both are absent).
@@ -164,12 +165,14 @@ export function getManyInternal(
   const result: { [sheetName: string]: GQueryResult } = {};
 
   // Fetch data using batchGet for better performance
-  const dataResponse = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
-      ranges: sheetNames,
-      valueRenderOption,
-      dateTimeRenderOption,
-    }),
+  const dataResponse = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.batchGet(GQuery.spreadsheetId, {
+        ranges: sheetNames.map((sheetName) => sheetRange(sheetName)),
+        valueRenderOption,
+        dateTimeRenderOption,
+      }),
+    GQuery.retries,
   );
 
   if (!dataResponse || !dataResponse.valueRanges) {

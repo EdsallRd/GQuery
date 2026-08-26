@@ -13,6 +13,7 @@ Yet another Google Sheets ORM for Apps Script, supporting advanced features like
   - [Runtime Validation](#runtime-validation)
   - [Handling Validation Errors](#handling-validation-errors)
 - [Usage](#usage)
+  - [Using Targeted Value Ranges](#using-targeted-value-ranges)
   - [Using GET](#using-get)
   - [Using GET MANY](#using-get-many)
   - [Using QUERY](#using-query)
@@ -151,6 +152,43 @@ try {
 ---
 
 ## Usage
+
+### Using Targeted Value Ranges
+
+For large sheets, use the targeted Values API instead of `.where()` when the
+row or A1 range is already known. `sheetRange()` always quotes and escapes the
+literal sheet title, including titles with spaces or apostrophes.
+
+```typescript
+import { GQuery, sheetRange } from "@edsallrd/gquery";
+
+const gq = new GQuery("your-spreadsheet-id", { retries: 3 });
+const row = sheetRange("QuickTicket Users", "A2:F2");
+
+const current = gq.getValues(row, {
+  valueRenderOption: "UNFORMATTED_VALUE",
+});
+
+gq.updateValues(row, [["user@example.edu", "revision-2"]], {
+  valueInputOption: "RAW",
+});
+
+gq.batchUpdateValues([
+  { range: sheetRange("QuickTicket Users", "D2"), values: [["revision-3"]] },
+  { range: sheetRange("QuickTicket Users", "F2"), values: [[new Date().toISOString()]] },
+]);
+
+const appended = gq.appendValues(
+  sheetRange("QuickTicket Errors"),
+  [[new Date().toISOString(), "SERVER_ERROR"]],
+);
+console.log(appended.updatedRange);
+```
+
+`retries` is the number of quota/rate-limit retries after the initial request
+and must be an integer from 0 through 6. The default is 4. Targeted writes use
+`USER_ENTERED` unless `valueInputOption: "RAW"` is supplied, and cache
+invalidation is best-effort after a successful Sheets write.
 
 This chart shows a quick overview of the different functions GQuery offers.
 

@@ -37,16 +37,19 @@ export function readThrough<T>(
 }
 
 export function invalidateSheet(sheetName: string): void {
-  const cache = CacheService.getScriptCache();
-  // Default key
-  cache.remove(defaultKey(sheetName));
-  // Any tracked custom keys for this sheet
-  const tracked = readKeyIndex();
-  const prefix = `gq:${sheetName}:`;
-  const toRemove = tracked.filter((k) => k.startsWith(prefix));
-  if (toRemove.length > 0) {
-    cache.removeAll(toRemove);
-    writeKeyIndex(tracked.filter((k) => !toRemove.includes(k)));
+  try {
+    const cache = CacheService.getScriptCache();
+    // Cache invalidation follows a committed write and must never change its result.
+    cache.remove(defaultKey(sheetName));
+    const tracked = readKeyIndex();
+    const prefix = `gq:${sheetName}:`;
+    const toRemove = tracked.filter((k) => k.startsWith(prefix));
+    if (toRemove.length > 0) {
+      cache.removeAll(toRemove);
+      writeKeyIndex(tracked.filter((k) => !toRemove.includes(k)));
+    }
+  } catch {
+    // CacheService is only an optimization. The successful Sheets write stands.
   }
 }
 

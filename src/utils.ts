@@ -1,5 +1,6 @@
 import { callHandler } from "./ratelimit";
 import { GQueryRow } from "./types";
+import { sheetRange } from "./a1";
 
 /**
  * Try to parse a string as a JSON object or array. Returns the original
@@ -83,9 +84,15 @@ export function parseRows(headers: string[], values: any[][]): GQueryRow[] {
 export function fetchSheetData(
   spreadsheetId: string,
   sheetName: string,
+  retries?: number,
 ): { headers: string[]; rows: GQueryRow[] } {
-  const response = callHandler(() =>
-    Sheets!.Spreadsheets!.Values!.get(spreadsheetId, sheetName),
+  const response = callHandler(
+    () =>
+      Sheets!.Spreadsheets!.Values!.get(
+        spreadsheetId,
+        sheetRange(sheetName),
+      ),
+    retries,
   );
 
   const values = response.values || [];

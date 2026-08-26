@@ -1,18 +1,28 @@
 import { type CacheOptions } from "./cache";
-import { GQueryReadOptions, GQueryResult, GQueryRow, InferSchema, StandardSchemaV1 } from "./types";
+import { GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryGetValuesOptions, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueRangeInput, GQueryValueRangeResult, GQueryWriteValuesOptions, InferSchema, StandardSchemaV1 } from "./types";
 export type { CacheOptions };
 export * from "./types";
+export * from "./a1";
 /**
  * Main GQuery class for interacting with Google Sheets
  * Provides a query-like interface for reading and writing spreadsheet data
  */
 export declare class GQuery {
     spreadsheetId: string;
+    readonly retries: number;
     /**
      * Create a new GQuery instance
      * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
      */
-    constructor(spreadsheetId?: string);
+    constructor(spreadsheetId?: string, options?: GQueryOptions);
+    /** Read one targeted A1 range without loading an entire sheet. */
+    getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
+    /** Update one targeted A1 range and invalidate its sheet cache. */
+    updateValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryWriteValuesOptions): GQueryUpdateValuesResult;
+    /** Atomically update several targeted A1 ranges. */
+    batchUpdateValues(ranges: readonly GQueryValueRangeInput[], options?: GQueryWriteValuesOptions): GQueryBatchUpdateValuesResult;
+    /** Append values to a targeted table range and return its updated range. */
+    appendValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryAppendValuesOptions): GQueryAppendValuesResult;
     /**
      * Get a typed table reference for a specific sheet using a Standard Schema.
      * The schema's output type flows through all subsequent operations.

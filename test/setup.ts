@@ -11,6 +11,7 @@ vi.stubGlobal("Sheets", {
     Values: {
       get: vi.fn(),
       batchGet: vi.fn(),
+      update: vi.fn(),
       append: vi.fn(),
       batchUpdate: vi.fn(),
     },

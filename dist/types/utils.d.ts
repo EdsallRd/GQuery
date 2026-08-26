@@ -24,7 +24,7 @@ export declare function parseRows(headers: string[], values: any[][]): GQueryRow
  * @param sheetName The name of the sheet to fetch
  * @returns Object containing headers and rows
  */
-export declare function fetchSheetData(spreadsheetId: string, sheetName: string): {
+export declare function fetchSheetData(spreadsheetId: string, sheetName: string, retries?: number): {
     headers: string[];
     rows: GQueryRow[];
 };
