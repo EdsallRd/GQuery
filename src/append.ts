@@ -1,4 +1,4 @@
-import { GQueryTable } from "./index";
+import { GQueryTable } from "./legacy";
 import { callHandler } from "./ratelimit";
 import {
   GQueryReadOptions,

@@ -1,4 +1,4 @@
-import { GQuery, GQueryTable, GQueryTableFactory } from "./index";
+import { GQuery, GQueryTable, GQueryTableFactory } from "./legacy";
 import { GQueryReadOptions, GQueryResult } from "./types";
 export declare function getManyInternal(GQuery: GQuery, sheetNames: string[], options?: GQueryReadOptions): {
     [sheetName: string]: GQueryResult;

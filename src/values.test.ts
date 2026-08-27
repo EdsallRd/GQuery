@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { GQuery, sheetRange } from "./index";
+import { GQuery, sheetRange } from "./legacy";
 
 describe("targeted Values API", () => {
   let cache: { get: any; put: any; remove: any; removeAll: any };

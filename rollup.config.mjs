@@ -48,11 +48,16 @@ function rollupGasBundler(options = {}) {
                 }
 
                 if (wrapGlobalDts && isGlobalDts) {
-                    const indented = file.code
-                        .split("\n")
-                        .map((line) => line.length > 0 ? "  " + line : line)
-                        .join("\n");
-                    file.code = `declare namespace ${namespaceName} {\n${indented}\n}\ndeclare var ${namespaceName}: typeof ${namespaceName};\n`;
+                    file.code = [
+                        `import * as ${namespaceName}Module from "./bundle.js";`,
+                        "",
+                        "declare global {",
+                        `  const ${namespaceName}: typeof ${namespaceName}Module.createGQuery & typeof ${namespaceName}Module;`,
+                        "}",
+                        "",
+                        "export {};",
+                        "",
+                    ].join("\n");
                 }
             }
         }
@@ -85,7 +90,7 @@ export default [
             interop: "esModule",
             name: "GQuery",
         },
-        plugins: [...plugins, rollupGasBundler()],
+        plugins: [...plugins, rollupGasBundler({ returnClassName: "createGQuery" })],
         external: ["google-apps-script"],
     },
     {

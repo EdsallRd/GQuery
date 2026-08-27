@@ -1,8 +1,22 @@
 {
   "name": "@edsallrd/gquery",
-  "version": "1.5.3",
+  "version": "2.0.0-beta.0",
   "main": "dist/bundle.js",
+  "module": "dist/bundle.js",
   "types": "dist/bundle.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/bundle.d.ts",
+      "import": "./dist/bundle.js",
+      "default": "./dist/bundle.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "sideEffects": false,
   "source": "src/index.ts",
   "author": "Edsall Park <https://github.com/EdsallRd>",
   "repository": {
@@ -12,7 +26,10 @@
   "scripts": {
     "build": "rollup -c",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.type-tests.json",
+    "package:smoke": "node scripts/package-smoke.mjs",
+    "ci": "npm run typecheck && npm test && npm run build && npm run package:smoke"
   },
   "dependencies": {
     "@types/google-apps-script": "^2.0.8"

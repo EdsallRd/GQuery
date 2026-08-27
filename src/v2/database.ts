@@ -1,0 +1,1269 @@
+import {
+  GQueryExecutor,
+  type ExecutableQuery,
+  type ExecutorOptions,
+  type RuntimeGenerationAdapter,
+  type UnitOfWorkCommitResult,
+  type UnitOfWorkIntent,
+  type WriteConstraintSnapshot,
+  type WorkbookCommitReceipt,
+} from "./executor";
+import { createExecutionStats, mergeExecutionStats, type ExecutionPlan, type ExecutionStats } from "./execution";
+import {
+  cloneQueryPlan,
+  combinePredicates,
+  emptyQueryPlan,
+  normalizeWhere,
+  type JoinCardinality,
+  type JoinKind,
+  type SerializableQueryPlan,
+  type SortDirection,
+  type Where,
+} from "./query";
+import { GQueryRuntimeError } from "./runtime-errors";
+import {
+  SELECTION_INTERNAL,
+  Selection,
+  type DeleteOptions,
+  type MutationOptions,
+  type MutationPatch,
+  type MutationResult,
+  type SelectionRuntime,
+} from "./selection";
+import type {
+  DatabaseDefinition,
+  InferTableRow,
+  RelationDefinition,
+  RelationMap,
+  SourceMap,
+  TableDefinition,
+} from "./schema";
+import {
+  AppsScriptSheetsTransport,
+  type AtomicMutation,
+  type SheetBatchGetResult,
+  type SheetBatchUpdateOptions,
+  type SheetBatchUpdateResult,
+  type SheetReadOptions,
+  type SheetValueRange,
+  type SheetValueUpdate,
+  type SheetsTransport,
+} from "./transport";
+import type { SyncLock } from "./infrastructure/runtime";
+import { RetryController } from "./infrastructure/retry";
+import {
+  ScopedRetryTransportInvoker,
+  type ScopedRetryTransportInvokerOptions,
+} from "./infrastructure/retry-transport";
+import {
+  createAppsScriptChunkedCache,
+  createAppsScriptGenerationStore,
+  type AppsScriptCacheScope,
+  type ChunkedCache,
+} from "./infrastructure/cache";
+import { SchemaManager } from "./management";
+import { SystemManager } from "./system-manager";
+import type { ManualEditHooks } from "./infrastructure/system";
+import { DeferredManager } from "./deferred-manager";
+import {
+  createAppsScriptDeferredJournal,
+  type DeferredDeadLetterSink,
+  type DeferredJournal,
+} from "./infrastructure/deferred";
+import type { PropertyStore } from "./infrastructure/runtime";
+import type { MaterializedRow } from "./provenance";
+import { validateJoinPlan } from "./join-validation";
+import { CacheInvalidationManager, type CacheInvalidationApi } from "./cache-manager";
+
+type AnyRow = Record<string, unknown>;
+type TableNames<D extends DatabaseDefinition> = Extract<keyof D["tables"], string>;
+type TableAt<D extends DatabaseDefinition, N extends TableNames<D>> = D["tables"][N];
+export type RowAt<D extends DatabaseDefinition, N extends TableNames<D>> =
+  Extract<InferTableRow<TableAt<D, N>>, AnyRow>;
+
+type RelationsAt<D extends DatabaseDefinition, N extends TableNames<D>> =
+  TableAt<D, N> extends TableDefinition<
+    infer _Columns,
+    infer _Source,
+    infer _Primary,
+    infer Relations,
+    infer _Unique
+  > ? Relations : RelationMap;
+
+type RelationTarget<R> = R extends RelationDefinition<
+  infer _Kind,
+  infer Target,
+  infer _Local,
+  infer _Foreign
+> ? Target : never;
+
+type RelationValue<
+  D extends DatabaseDefinition,
+  R,
+> = RelationTarget<R> extends TableNames<D>
+  ? R extends RelationDefinition<"has-many">
+    ? readonly RowAt<D, Extract<RelationTarget<R>, TableNames<D>>>[]
+    : RowAt<D, Extract<RelationTarget<R>, TableNames<D>>> | null
+  : never;
+
+export type IncludedRow<
+  D extends DatabaseDefinition,
+  N extends TableNames<D>,
+  Row extends AnyRow,
+  R extends Extract<keyof RelationsAt<D, N>, string>,
+> = Row & { readonly [Name in R]: RelationValue<D, RelationsAt<D, N>[Name]> };
+
+export interface JoinOptions<
+  Row extends AnyRow,
+  OtherRow extends AnyRow,
+  Alias extends string,
+  Kind extends JoinKind = "left",
+  Cardinality extends JoinCardinality = "one",
+  Selected extends readonly Extract<keyof OtherRow, string>[] | undefined = undefined,
+> {
+  readonly as: Alias;
+  readonly on: {
+    readonly local: Extract<keyof Row, string> | readonly Extract<keyof Row, string>[];
+    readonly foreign: Extract<keyof OtherRow, string> | readonly Extract<keyof OtherRow, string>[];
+  };
+  readonly kind?: Kind;
+  readonly cardinality?: Cardinality;
+  readonly select?: Selected;
+}
+
+type SelectedJoinRow<
+  Target extends AnyRow,
+  Selected extends readonly Extract<keyof Target, string>[] | undefined,
+> = Selected extends readonly Extract<keyof Target, string>[]
+  ? Pick<Target, Selected[number]>
+  : Target;
+
+type AdHocJoinedRow<
+  Base extends AnyRow,
+  Target extends AnyRow,
+  Alias extends string,
+  Kind extends JoinKind,
+  Cardinality extends JoinCardinality,
+  Selected extends readonly Extract<keyof Target, string>[] | undefined,
+> = Kind extends "semi" | "anti"
+  ? Base
+  : Base & {
+      readonly [Key in Alias]: Cardinality extends "many"
+        ? readonly SelectedJoinRow<Target, Selected>[]
+        : Kind extends "inner"
+          ? SelectedJoinRow<Target, Selected>
+          : SelectedJoinRow<Target, Selected> | null;
+    };
+
+export interface Group<T extends AnyRow> {
+  readonly key: Readonly<Partial<T>>;
+  readonly rows: readonly Readonly<T>[];
+  readonly count: number;
+}
+
+export interface UpsertResult<T extends AnyRow> {
+  readonly status: "committed" | "queued" | "conflicted" | "partial";
+  readonly inserted: number;
+  readonly updated: number;
+  readonly unchanged: number;
+  readonly conflicted: number;
+  readonly workbooks: readonly WorkbookCommitReceipt[];
+  readonly update?: MutationResult<T>;
+  readonly insert?: MutationResult<T>;
+  readonly stats: ExecutionStats;
+}
+
+export interface SyncOptions<T extends AnyRow> {
+  readonly keys?: readonly Extract<keyof T, string>[];
+  readonly preserve?: readonly Extract<keyof T, string>[];
+  readonly missing?:
+    | { readonly action: "keep" }
+    | { readonly action: "delete" }
+    | {
+        readonly action: "deactivate";
+        readonly field: Extract<keyof T, string>;
+        readonly value: T[Extract<keyof T, string>];
+      };
+}
+
+export interface SyncResult<T extends AnyRow> extends UpsertResult<T> {
+  readonly deactivated: number;
+  readonly deleted: number;
+}
+
+function nonNegativeInteger(label: string, value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new GQueryRuntimeError("INVALID_QUERY", `${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function rowFingerprint(row: AnyRow, keys: readonly string[]): string {
+  return JSON.stringify(keys.map((key) => row[key]));
+}
+
+function rowsEqual(left: AnyRow, right: AnyRow, fields: readonly string[]): boolean {
+  return fields.every((field) => {
+    const a = left[field];
+    const b = right[field];
+    if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
+    if (Object.is(a, b)) return true;
+    if (a !== null && b !== null && typeof a === "object" && typeof b === "object") {
+      try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
+    }
+    return false;
+  });
+}
+
+/** An immutable query handle. Every chain method returns a new instance. */
+export class Query<
+  D extends DatabaseDefinition,
+  N extends TableNames<D>,
+  Row extends AnyRow = RowAt<D, N>,
+> {
+  protected readonly localPredicates: readonly ((row: Readonly<Row>) => boolean)[];
+
+  public constructor(
+    protected readonly database: GQueryDatabase<D>,
+    public readonly tableName: N,
+    protected readonly plan: SerializableQueryPlan,
+    localPredicates: readonly ((row: Readonly<Row>) => boolean)[] = [],
+  ) {
+    this.localPredicates = Object.freeze([...localPredicates]);
+  }
+
+  protected next<NextRow extends AnyRow = Row>(
+    plan: SerializableQueryPlan,
+    localPredicates: readonly ((row: Readonly<NextRow>) => boolean)[] = this.localPredicates as unknown as readonly ((row: Readonly<NextRow>) => boolean)[],
+  ): Query<D, N, NextRow> {
+    return new Query(this.database, this.tableName, plan, localPredicates);
+  }
+
+  public all(): Query<D, N, Row> {
+    return this.next(this.plan);
+  }
+
+  public where(predicate: Where<Row>): Query<D, N, Row> {
+    const normalized = normalizeWhere(predicate);
+    return this.next(cloneQueryPlan(this.plan, {
+      predicate: combinePredicates(this.plan.predicate, normalized),
+    }));
+  }
+
+  public whereLocal(predicate: (row: Readonly<Row>) => boolean): Query<D, N, Row> {
+    if (typeof predicate !== "function") throw new TypeError("whereLocal() expects a callback.");
+    return this.next(this.plan, [...this.localPredicates, predicate]);
+  }
+
+  public select<const Fields extends readonly Extract<keyof Row, string>[]>(
+    fields: Fields,
+  ): Query<D, N, Pick<Row, Fields[number]> & AnyRow> {
+    if (fields.length === 0) throw new GQueryRuntimeError("INVALID_QUERY", "select() requires at least one field.");
+    return this.next<Pick<Row, Fields[number]> & AnyRow>(
+      cloneQueryPlan(this.plan, { projection: [...fields] }),
+      this.localPredicates as unknown as readonly ((row: Readonly<Pick<Row, Fields[number]> & AnyRow>) => boolean)[],
+    );
+  }
+
+  public orderBy(
+    field: Extract<keyof Row, string>,
+    direction: SortDirection = "asc",
+  ): Query<D, N, Row> {
+    return this.next(cloneQueryPlan(this.plan, {
+      orderBy: [...this.plan.orderBy, { field, direction }],
+    }));
+  }
+
+  public limit(value: number): Query<D, N, Row> {
+    return this.next(cloneQueryPlan(this.plan, { limit: nonNegativeInteger("limit", value) }));
+  }
+
+  public offset(value: number): Query<D, N, Row> {
+    return this.next(cloneQueryPlan(this.plan, { offset: nonNegativeInteger("offset", value) }));
+  }
+
+  public tail(value: number): Query<D, N, Row> {
+    return this.next(cloneQueryPlan(this.plan, { tail: nonNegativeInteger("tail", value) }));
+  }
+
+  public include<RelationName extends Extract<keyof RelationsAt<D, N>, string>>(
+    name: RelationName,
+  ): Query<D, N, IncludedRow<D, N, Row, RelationName>> {
+    const relation = this.database.definition.tables[this.tableName].relations[name] as RelationDefinition | undefined;
+    if (relation === undefined) {
+      throw new GQueryRuntimeError("RELATION_NOT_FOUND", `Table ${this.tableName} has no relation ${name}.`);
+    }
+    const nextPlan = cloneQueryPlan(this.plan, {
+      joins: [...this.plan.joins, {
+        table: relation.target,
+        alias: name,
+        localField: relation.local,
+        foreignField: relation.foreign,
+        kind: "left",
+        cardinality: relation.cardinality,
+        relationName: name,
+      }],
+    });
+    validateJoinPlan(this.database.definition, nextPlan);
+    return this.next<IncludedRow<D, N, Row, RelationName>>(nextPlan);
+  }
+
+  public join<
+    OtherName extends TableNames<D>,
+    const Alias extends string,
+    const Kind extends JoinKind = "left",
+    const Cardinality extends JoinCardinality = "one",
+    const Selected extends readonly Extract<keyof RowAt<D, OtherName>, string>[] | undefined = undefined,
+  >(
+    other: TableHandle<D, OtherName>,
+    options: JoinOptions<Row, RowAt<D, OtherName>, Alias, Kind, Cardinality, Selected>,
+  ): Query<
+    D,
+    N,
+    AdHocJoinedRow<Row, RowAt<D, OtherName>, Alias, Kind, Cardinality, Selected>
+  > {
+    const nextPlan = cloneQueryPlan(this.plan, {
+      joins: [...this.plan.joins, {
+        table: other.tableName,
+        alias: options.as,
+        localField: options.on.local,
+        foreignField: options.on.foreign,
+        kind: options.kind ?? "left",
+        cardinality: options.cardinality ?? "one",
+        select: options.select,
+      }],
+    });
+    validateJoinPlan(this.database.definition, nextPlan);
+    return this.next(nextPlan) as Query<
+      D,
+      N,
+      AdHocJoinedRow<Row, RowAt<D, OtherName>, Alias, Kind, Cardinality, Selected>
+    >;
+  }
+
+  public get(): Selection<Row> {
+    return this.database.materialize(this.database.executor.execute(this.executable()).selection);
+  }
+
+  public findOne(): Selection<Row> {
+    const result = this.limit(2).get();
+    if (result.length !== 1) {
+      throw new GQueryRuntimeError(
+        "EXPECTED_ONE",
+        `Expected exactly one ${this.tableName} row; received ${result.length}.`,
+        { details: { table: this.tableName, count: result.length } },
+      );
+    }
+    return result;
+  }
+
+  public maybeOne(): Selection<Row> {
+    const result = this.limit(2).get();
+    if (result.length > 1) {
+      throw new GQueryRuntimeError(
+        "EXPECTED_ONE",
+        `Expected at most one ${this.tableName} row; received ${result.length}.`,
+        { details: { table: this.tableName, count: result.length } },
+      );
+    }
+    return result;
+  }
+
+  public find(key: unknown): Selection<Row> {
+    const definition = this.database.definition.tables[this.tableName];
+    if (definition.primaryKey.length === 0) {
+      throw new GQueryRuntimeError("INVALID_QUERY", `Table ${this.tableName} has no primary key.`);
+    }
+    const predicate: Record<string, unknown> = {};
+    if (definition.primaryKey.length === 1 && (key === null || typeof key !== "object" || key instanceof Date)) {
+      predicate[definition.primaryKey[0]] = key;
+    } else {
+      if (key === null || typeof key !== "object" || Array.isArray(key)) {
+        throw new GQueryRuntimeError("INVALID_QUERY", `Composite key lookup for ${this.tableName} requires an object.`);
+      }
+      for (const field of definition.primaryKey) predicate[field] = (key as AnyRow)[field];
+    }
+    return this.where(predicate as Where<Row>).maybeOne();
+  }
+
+  public count(): number {
+    return this.get().length;
+  }
+
+  public exists(): boolean {
+    return this.limit(1).get().length > 0;
+  }
+
+  public groupBy(
+    fields: readonly Extract<keyof Row, string>[],
+  ): readonly Group<Row>[] {
+    if (fields.length === 0) throw new GQueryRuntimeError("INVALID_QUERY", "groupBy() requires at least one field.");
+    const result = this.get();
+    const groups = new Map<string, { key: Partial<Row>; rows: Readonly<Row>[] }>();
+    for (const row of result.rows) {
+      const key: Partial<Row> = {};
+      for (const field of fields) key[field] = row[field] as Row[typeof field];
+      const fingerprint = JSON.stringify(fields.map((field) => row[field]));
+      const group = groups.get(fingerprint) ?? { key, rows: [] };
+      group.rows.push(row);
+      groups.set(fingerprint, group);
+    }
+    return Object.freeze([...groups.values()].map((group) => Object.freeze({
+      key: Object.freeze(group.key),
+      rows: Object.freeze(group.rows),
+      count: group.rows.length,
+    })));
+  }
+
+  public update(patch: MutationPatch<Row>, options?: MutationOptions): MutationResult<Row> {
+    return this.get().update(patch, options);
+  }
+
+  public delete(options?: DeleteOptions): MutationResult<Row> {
+    return this.get().delete(options);
+  }
+
+  public explain(): ExecutionPlan {
+    return this.database.executor.explain(this.executable());
+  }
+
+  public executable(): ExecutableQuery<Row> {
+    return this.database.decorateExecutable({
+      plan: this.plan,
+      localPredicates: this.localPredicates,
+      refresh: () => this.get(),
+    });
+  }
+}
+
+export class TableHandle<
+  D extends DatabaseDefinition,
+  N extends TableNames<D>,
+> extends Query<D, N, RowAt<D, N>> {
+  public constructor(database: GQueryDatabase<D>, tableName: N) {
+    const definition = database.definition.tables[tableName];
+    super(database, tableName, emptyQueryPlan(tableName, definition.source));
+  }
+
+  public append(
+    row: RowAt<D, N>,
+  ): MutationResult<RowAt<D, N>> {
+    return this.appendMany([row]);
+  }
+
+  public appendMany(
+    rows: readonly RowAt<D, N>[],
+  ): MutationResult<RowAt<D, N>> {
+    return this.database.appendRows(this.tableName, rows);
+  }
+
+  public upsertMany(
+    incoming: readonly RowAt<D, N>[],
+    options: { readonly keys?: readonly Extract<keyof RowAt<D, N>, string>[] } = {},
+  ): UpsertResult<RowAt<D, N>> {
+    const definition = this.database.definition.tables[this.tableName];
+    const keys = (options.keys ?? definition.primaryKey) as readonly string[];
+    if (keys.length === 0) throw new GQueryRuntimeError("INVALID_QUERY", `upsertMany() requires keys for ${this.tableName}.`);
+    const current = this.get();
+    const currentByKey = new Map(current.rows.map((row, index) => [rowFingerprint(row, keys), index]));
+    const incomingByKey = new Map<string, RowAt<D, N>>();
+    for (const row of incoming) {
+      const fingerprint = rowFingerprint(row, keys);
+      if (incomingByKey.has(fingerprint)) throw new GQueryRuntimeError("DUPLICATE_KEY", "upsertMany input contains duplicate keys.");
+      incomingByKey.set(fingerprint, row);
+    }
+    const updates = new Map<string, RowAt<D, N>>();
+    const inserts: RowAt<D, N>[] = [];
+    let unchanged = 0;
+    const fields = Object.keys(definition.columns);
+    for (const [fingerprint, row] of incomingByKey) {
+      const currentIndex = currentByKey.get(fingerprint);
+      if (currentIndex === undefined) inserts.push(row);
+      else if (rowsEqual(current.rows[currentIndex], row, fields)) unchanged += 1;
+      else updates.set(fingerprint, row);
+    }
+    const intents: UnitOfWorkIntent[] = [];
+    if (updates.size > 0) {
+      const materialized = current[SELECTION_INTERNAL].materialized.filter((item) => updates.has(rowFingerprint(item.value, keys)));
+      const subset = new Selection(materialized, current.headers, current.stats, this.database.executor, () => this.get());
+      intents.push({
+        id: "upsert:update",
+        kind: "update",
+        selection: subset as unknown as Selection<Record<string, unknown>>,
+        patch: (row) => updates.get(rowFingerprint(row, keys)) ?? {},
+      });
+    }
+    if (inserts.length > 0) {
+      intents.push({
+        id: "upsert:append",
+        kind: "append",
+        tableName: this.tableName,
+        rows: inserts,
+      });
+    }
+    const committed = this.database.commitIntents(intents, [{
+      tableName: this.tableName,
+      rows: current[SELECTION_INTERNAL].materialized as readonly MaterializedRow<Record<string, unknown>>[],
+    }]);
+    const succeeded = committed.status === "committed" || committed.status === "queued";
+    return {
+      status: committed.status,
+      inserted: succeeded ? inserts.length : 0,
+      updated: succeeded ? updates.size : 0,
+      unchanged,
+      conflicted: committed.conflicts.length,
+      workbooks: committed.workbooks,
+      stats: mergeExecutionStats(current.stats, committed.stats),
+    };
+  }
+
+  public sync(
+    incoming: readonly RowAt<D, N>[],
+    options: SyncOptions<RowAt<D, N>> = {},
+  ): SyncResult<RowAt<D, N>> {
+    const definition = this.database.definition.tables[this.tableName];
+    const keys = (options.keys ?? definition.primaryKey) as readonly string[];
+    if (keys.length === 0) throw new GQueryRuntimeError("INVALID_QUERY", `sync() requires keys for ${this.tableName}.`);
+    const preserve = new Set<string>(options.preserve ?? []);
+    const current = this.get();
+    const currentByKey = new Map(current.rows.map((row, index) => [rowFingerprint(row, keys), index]));
+    const incomingByKey = new Map<string, RowAt<D, N>>();
+    for (const input of incoming) {
+      const fingerprint = rowFingerprint(input, keys);
+      if (incomingByKey.has(fingerprint)) throw new GQueryRuntimeError("DUPLICATE_KEY", "sync input contains duplicate keys.");
+      const existingIndex = currentByKey.get(fingerprint);
+      const next = { ...input } as RowAt<D, N>;
+      if (existingIndex !== undefined) {
+        const existing = current.rows[existingIndex];
+        for (const field of preserve) (next as AnyRow)[field] = existing[field];
+      }
+      incomingByKey.set(fingerprint, next);
+    }
+    const incomingKeys = new Set(incomingByKey.keys());
+    const fields = Object.keys(definition.columns);
+    const updates = new Map<string, RowAt<D, N>>();
+    const inserts: RowAt<D, N>[] = [];
+    let unchanged = 0;
+    for (const [fingerprint, row] of incomingByKey) {
+      const existingIndex = currentByKey.get(fingerprint);
+      if (existingIndex === undefined) inserts.push(row);
+      else if (rowsEqual(current.rows[existingIndex], row, fields)) unchanged += 1;
+      else updates.set(fingerprint, row);
+    }
+    const missing = current[SELECTION_INTERNAL].materialized.filter((item) => !incomingKeys.has(rowFingerprint(item.value, keys)));
+    const intents: UnitOfWorkIntent[] = [];
+    if (updates.size > 0) {
+      const materialized = current[SELECTION_INTERNAL].materialized.filter((item) => updates.has(rowFingerprint(item.value, keys)));
+      const subset = new Selection(materialized, current.headers, current.stats, this.database.executor, () => this.get());
+      intents.push({
+        id: "sync:update",
+        kind: "update",
+        selection: subset as unknown as Selection<Record<string, unknown>>,
+        patch: (row) => updates.get(rowFingerprint(row, keys)) ?? {},
+      });
+    }
+    if (inserts.length > 0) {
+      intents.push({ id: "sync:append", kind: "append", tableName: this.tableName, rows: inserts });
+    }
+    if (missing.length > 0 && options.missing?.action === "delete") {
+      const subset = new Selection(missing, current.headers, current.stats, this.database.executor, () => this.get());
+      intents.push({
+        id: "sync:delete",
+        kind: "delete",
+        selection: subset as unknown as Selection<Record<string, unknown>>,
+      });
+    } else if (missing.length > 0 && options.missing?.action === "deactivate") {
+      const subset = new Selection(missing, current.headers, current.stats, this.database.executor, () => this.get());
+      intents.push({
+        id: "sync:deactivate",
+        kind: "update",
+        selection: subset as unknown as Selection<Record<string, unknown>>,
+        patch: { [options.missing.field]: options.missing.value },
+      });
+    }
+    const committed = this.database.commitIntents(intents, [{
+      tableName: this.tableName,
+      rows: current[SELECTION_INTERNAL].materialized as readonly MaterializedRow<Record<string, unknown>>[],
+    }]);
+    const succeeded = committed.status === "committed" || committed.status === "queued";
+    return {
+      status: committed.status,
+      inserted: succeeded ? inserts.length : 0,
+      updated: succeeded ? updates.size : 0,
+      unchanged,
+      conflicted: committed.conflicts.length,
+      workbooks: committed.workbooks,
+      deactivated: succeeded && options.missing?.action === "deactivate" ? missing.length : 0,
+      deleted: succeeded && options.missing?.action === "delete" ? missing.length : 0,
+      stats: mergeExecutionStats(current.stats, committed.stats),
+    };
+  }
+}
+
+export type TableHandles<D extends DatabaseDefinition> = {
+  readonly [N in TableNames<D>]: TableHandle<D, N>;
+};
+
+type BatchSelections<Q extends Readonly<Record<string, Query<any, any, any>>>> = {
+  readonly [K in keyof Q]: Q[K] extends Query<any, any, infer Row>
+    ? Selection<Extract<Row, AnyRow>>
+    : never;
+};
+
+export class BatchQuery<
+  D extends DatabaseDefinition,
+  Q extends Readonly<Record<string, Query<any, any, any>>>,
+> {
+  public constructor(
+    private readonly database: GQueryDatabase<D>,
+    private readonly queries: Q,
+  ) {}
+
+  public get(): BatchSelections<Q> {
+    const executable: Record<string, ExecutableQuery<AnyRow>> = {};
+    for (const [name, query] of Object.entries(this.queries)) executable[name] = query.executable();
+    const selections = this.database.executor.executeBatch(executable).selections;
+    const materialized: Record<string, Selection<AnyRow>> = {};
+    for (const [name, selection] of Object.entries(selections)) {
+      materialized[name] = this.database.materialize(selection);
+    }
+    return materialized as BatchSelections<Q>;
+  }
+}
+
+export interface RawValuesApi<Sources extends SourceMap> {
+  get(source: Extract<keyof Sources, string>, range: string, options?: SheetReadOptions): SheetValueRange;
+  batchGet(source: Extract<keyof Sources, string>, ranges: readonly string[], options?: SheetReadOptions): SheetBatchGetResult;
+  batchUpdate(
+    source: Extract<keyof Sources, string>,
+    updates: readonly SheetValueUpdate[],
+    options?: SheetBatchUpdateOptions,
+  ): SheetBatchUpdateResult;
+  atomicBatchUpdate(source: Extract<keyof Sources, string>, mutations: readonly AtomicMutation[]): void;
+}
+
+export interface CreateGQueryOptions extends Omit<ExecutorOptions, "transport"> {
+  readonly transport?: SheetsTransport;
+  readonly retry?: ScopedRetryTransportInvokerOptions;
+  readonly systemHooks?: ManualEditHooks;
+  readonly deferredDeadLetters?: DeferredDeadLetterSink;
+  readonly deferredAppliedReceipts?: PropertyStore;
+}
+
+export interface UnitOfWorkOptions {
+  readonly lock?: "auto" | "document" | "script" | SyncLock;
+  readonly timeoutMs?: number;
+}
+
+export interface UnitOfWorkResult<T> extends UnitOfWorkCommitResult {
+  readonly value: T;
+  readonly lockWaitMs: number;
+}
+
+interface DatabaseInternals {
+  readonly executor: GQueryExecutor;
+  readonly transport: SheetsTransport;
+  readonly selectionRuntime: SelectionRuntime;
+  readonly append: (
+    tableName: string,
+    rows: readonly Record<string, unknown>[],
+  ) => MutationResult<Record<string, unknown>>;
+  readonly resolveActiveSpreadsheetId?: () => string;
+  readonly generations?: RuntimeGenerationAdapter;
+  readonly systemHooks?: ManualEditHooks;
+  readonly deferredJournal?: DeferredJournal;
+  readonly deferredDeadLetters?: DeferredDeadLetterSink;
+  readonly deferredAppliedReceipts?: PropertyStore;
+}
+
+class UnitOfWorkContext implements SelectionRuntime {
+  private readonly intents: UnitOfWorkIntent[] = [];
+  private readonly overlays = new Map<string, Record<string, unknown>>();
+  private readonly deleted = new Set<string>();
+  private readonly stagedUpdates = new Map<
+    string,
+    Extract<UnitOfWorkIntent, { kind: "update" }>
+  >();
+  private readonly stagedDeletes = new Set<string>();
+  private readonly cancelledIntents = new Set<UnitOfWorkIntent>();
+  private readonly virtualRows = new Map<
+    string,
+    { readonly tableName: string; readonly value: Record<string, unknown> }
+  >();
+  private readonly virtualIdentityByValue = new WeakMap<Record<string, unknown>, string>();
+  private readonly constraintSnapshots = new Map<string, WriteConstraintSnapshot>();
+  private sequence = 0;
+  private virtualSequence = 0;
+
+  public constructor(private readonly executor: GQueryExecutor) {}
+
+  public refresh<T extends AnyRow>(selection: Selection<T>): Selection<T> {
+    return this.apply(this.executor.refresh(selection));
+  }
+
+  public update<T extends AnyRow>(
+    selection: Selection<T>,
+    patch: MutationPatch<T>,
+  ): MutationResult<T> {
+    const id = this.nextId("update");
+    const materialized = selection[SELECTION_INTERNAL].materialized.map((item) => {
+      const identity = this.identity(item.provenance);
+      if (this.deleted.has(identity)) {
+        throw new GQueryRuntimeError(
+          "MUTATION_INVALID",
+          "A row deleted earlier in the unit of work cannot be updated.",
+          { details: { identity } },
+        );
+      }
+      const virtual = this.virtualRows.get(identity);
+      const current = (this.overlays.get(identity) ?? virtual?.value ?? item.value) as T;
+      const mutable = { ...current } as T;
+      const returned = typeof patch === "function" ? patch(mutable) : patch;
+      const changes = (typeof patch === "function" && returned === undefined ? mutable : returned) as Partial<T>;
+      const value = { ...current, ...changes } as T;
+      this.overlays.set(identity, value);
+
+      if (virtual !== undefined) {
+        // A staged append has no physical row to preflight. Mutate its private
+        // staging copy so the eventual append contains the latest value.
+        Object.assign(virtual.value, changes);
+      } else {
+        const existing = this.stagedUpdates.get(identity);
+        if (existing !== undefined) {
+          // Repeated updates to one row collapse into one physical write intent.
+          Object.assign(existing.patch as Record<string, unknown>, changes);
+        } else {
+          const stagedSelection = new Selection(
+            [item],
+            selection.headers,
+            selection.stats,
+            this,
+            selection[SELECTION_INTERNAL].refresh,
+          );
+          // Resolve callback patches exactly once while staging. Commit receives
+          // a serializable per-row patch, so side effects and time/random-based
+          // draft logic cannot run a second time with a different result.
+          const intent: Extract<UnitOfWorkIntent, { kind: "update" }> = {
+            id,
+            kind: "update",
+            selection: stagedSelection as unknown as Selection<Record<string, unknown>>,
+            patch: { ...changes } as Record<string, unknown>,
+          };
+          this.intents.push(intent);
+          this.stagedUpdates.set(identity, intent);
+        }
+      }
+      return { value, provenance: item.provenance };
+    });
+    const after = new Selection(
+      materialized,
+      selection.headers,
+      createExecutionStats(),
+      this,
+      selection[SELECTION_INTERNAL].refresh,
+    );
+    return {
+      status: "queued",
+      matchedCount: selection.length,
+      changedCount: selection.length,
+      changedCells: 0,
+      conflicts: [],
+      before: selection,
+      after,
+      stats: createExecutionStats(),
+      receipt: {
+        id,
+        idempotencyKey: id,
+        queuedAt: new Date().toISOString(),
+        operation: "update",
+        table: selection[SELECTION_INTERNAL].materialized[0]?.provenance.tableName ?? "unknown",
+        keys: selection[SELECTION_INTERNAL].materialized.map((item) => item.provenance.primaryKey),
+      },
+    };
+  }
+
+  public delete<T extends AnyRow>(selection: Selection<T>): MutationResult<T> {
+    const id = this.nextId("delete");
+    const physical: MaterializedRow<T>[] = [];
+    for (const item of selection[SELECTION_INTERNAL].materialized) {
+      const identity = this.identity(item.provenance);
+      if (this.deleted.has(identity)) continue;
+      this.deleted.add(identity);
+      const update = this.stagedUpdates.get(identity);
+      if (update !== undefined) {
+        this.cancelledIntents.add(update);
+        this.stagedUpdates.delete(identity);
+        this.overlays.delete(identity);
+      }
+      if (this.virtualRows.has(identity)) continue;
+      if (this.stagedDeletes.has(identity)) continue;
+      this.stagedDeletes.add(identity);
+      physical.push(item);
+    }
+    if (physical.length > 0) {
+      this.intents.push({
+        id,
+        kind: "delete",
+        selection: new Selection(
+          physical,
+          selection.headers,
+          selection.stats,
+          this,
+          selection[SELECTION_INTERNAL].refresh,
+        ) as unknown as Selection<Record<string, unknown>>,
+      });
+    }
+    return {
+      status: "queued",
+      matchedCount: selection.length,
+      changedCount: selection.length,
+      changedCells: 0,
+      conflicts: [],
+      before: selection,
+      stats: createExecutionStats(),
+      receipt: {
+        id,
+        idempotencyKey: id,
+        queuedAt: new Date().toISOString(),
+        operation: "delete",
+        table: selection[SELECTION_INTERNAL].materialized[0]?.provenance.tableName ?? "unknown",
+        keys: selection[SELECTION_INTERNAL].materialized.map((item) => item.provenance.primaryKey),
+      },
+    };
+  }
+
+  public append(
+    tableName: string,
+    rows: readonly Record<string, unknown>[],
+  ): MutationResult<Record<string, unknown>> {
+    const id = this.nextId("append");
+    const stagedRows = rows.map((row) => ({ ...row }));
+    for (const value of stagedRows) {
+      this.virtualSequence += 1;
+      const identity = `__gquery_uow__:-1:${-this.virtualSequence}`;
+      this.virtualRows.set(identity, { tableName, value });
+      this.virtualIdentityByValue.set(value, identity);
+    }
+    this.intents.push({ id, kind: "append", tableName, rows: stagedRows });
+    return {
+      status: "queued",
+      matchedCount: rows.length,
+      changedCount: rows.length,
+      changedCells: 0,
+      conflicts: [],
+      stats: createExecutionStats(),
+      receipt: {
+        id,
+        idempotencyKey: id,
+        queuedAt: new Date().toISOString(),
+        operation: "create",
+        table: tableName,
+        keys: [],
+      },
+    };
+  }
+
+  public apply<T extends AnyRow>(selection: Selection<T>): Selection<T> {
+    const materialized = this.overlayRows(
+      selection[SELECTION_INTERNAL].materialized[0]?.provenance.tableName ?? "",
+      selection[SELECTION_INTERNAL].materialized,
+    ) as readonly MaterializedRow<T>[];
+    return new Selection(
+      materialized,
+      selection.headers,
+      selection.stats,
+      this,
+      selection[SELECTION_INTERNAL].refresh,
+    );
+  }
+
+  public overlayRows(
+    tableName: string,
+    rows: readonly MaterializedRow<Record<string, unknown>>[],
+  ): readonly MaterializedRow<Record<string, unknown>>[] {
+    const physical = rows
+      .filter((item) => !this.deleted.has(this.identity(item.provenance)))
+      .map((item) => ({
+        value: this.overlays.get(this.identity(item.provenance)) ?? item.value,
+        provenance: item.provenance,
+      }));
+    const virtual: MaterializedRow<Record<string, unknown>>[] = [];
+    for (const [identity, item] of this.virtualRows) {
+      if (item.tableName !== tableName || this.deleted.has(identity)) continue;
+      const [, , rowIndex] = identity.split(":");
+      virtual.push({
+        value: item.value,
+        provenance: Object.freeze({
+          sourceName: "__unit_of_work__",
+          spreadsheetId: "__gquery_uow__",
+          tableName,
+          sheetName: tableName,
+          sheetId: -1,
+          rowIndex: Number(rowIndex),
+          primaryKey: Object.freeze({}),
+          encodedPrimaryKey: Object.freeze({}),
+          version: undefined,
+          originalEncoded: Object.freeze({}),
+          columnIndexes: Object.freeze({}),
+          headerFingerprint: "__unit_of_work__",
+          readAt: new Date().toISOString(),
+          relations: Object.freeze({}),
+          relationCardinalities: Object.freeze({}),
+        }),
+      });
+    }
+    return [...physical, ...virtual];
+  }
+
+  public commit(): UnitOfWorkCommitResult {
+    const active = this.intents
+      .filter((intent) => !this.cancelledIntents.has(intent))
+      .flatMap((intent): readonly UnitOfWorkIntent[] => {
+        if (intent.kind !== "append") return [intent];
+        const rows = intent.rows.filter((row) => {
+          const identity = this.virtualIdentityByValue.get(row);
+          return identity === undefined || !this.deleted.has(identity);
+        });
+        return rows.length === 0 ? [] : [{ ...intent, rows }];
+      });
+    return this.executor.commitUnitOfWorkWithSnapshots(
+      active,
+      [...this.constraintSnapshots.values()],
+    );
+  }
+
+  public stageIntents(
+    intents: readonly UnitOfWorkIntent[],
+    snapshots: readonly WriteConstraintSnapshot[] = [],
+  ): void {
+    for (const snapshot of snapshots) {
+      this.constraintSnapshots.set(snapshot.tableName, {
+        tableName: snapshot.tableName,
+        rows: snapshot.rows.filter(
+          (row) => row.provenance.spreadsheetId !== "__gquery_uow__",
+        ),
+      });
+    }
+    for (const intent of intents) {
+      if (intent.kind === "update") {
+        this.update(intent.selection, intent.patch);
+      } else if (intent.kind === "delete") {
+        this.delete(intent.selection);
+      } else {
+        this.append(intent.tableName, intent.rows);
+      }
+    }
+  }
+
+  private nextId(kind: string): string {
+    this.sequence += 1;
+    return `uow:${kind}:${this.sequence}`;
+  }
+
+  private identity(provenance: { spreadsheetId: string; sheetId: number; rowIndex: number }): string {
+    return `${provenance.spreadsheetId}:${provenance.sheetId}:${provenance.rowIndex}`;
+  }
+}
+
+function nativeLock(kind: "auto" | "document" | "script"): SyncLock | null {
+  if (typeof LockService === "undefined") return null;
+  const lock = kind === "script"
+    ? LockService.getScriptLock()
+    : kind === "document"
+      ? LockService.getDocumentLock()
+      : LockService.getDocumentLock() ?? LockService.getScriptLock();
+  if (lock === null) return null;
+  return {
+    tryAcquire: (timeoutMs) => lock.tryLock(timeoutMs),
+    release: () => lock.releaseLock(),
+  };
+}
+
+export class GQueryDatabase<D extends DatabaseDefinition> {
+  public readonly executor: GQueryExecutor;
+  public readonly tables: TableHandles<D>;
+  public readonly raw: { readonly values: RawValuesApi<D["sources"]> };
+  public readonly schema: SchemaManager;
+  public readonly system: SystemManager;
+  public readonly deferred: DeferredManager;
+  public readonly cache: CacheInvalidationApi<D>;
+  private readonly selectionRuntime: SelectionRuntime;
+  private readonly appendOperation: DatabaseInternals["append"];
+  private readonly transport: SheetsTransport;
+  private readonly activeResolver?: () => string;
+  private readonly generations?: RuntimeGenerationAdapter;
+  private readonly systemHooks?: ManualEditHooks;
+  private readonly deferredJournal?: DeferredJournal;
+  private readonly deferredDeadLetters?: DeferredDeadLetterSink;
+  private readonly deferredAppliedReceipts?: PropertyStore;
+
+  public constructor(
+    public readonly definition: D,
+    options: CreateGQueryOptions = {},
+    internals?: DatabaseInternals,
+  ) {
+    let defaultScope: ScopedRetryTransportInvoker | undefined;
+    let transport = internals?.transport ?? options.transport;
+    if (transport === undefined) {
+      defaultScope = new ScopedRetryTransportInvoker(new RetryController(), options.retry);
+      transport = new AppsScriptSheetsTransport({ invoker: defaultScope });
+    }
+    this.transport = transport;
+    this.activeResolver = internals?.resolveActiveSpreadsheetId ?? options.resolveActiveSpreadsheetId;
+    let cacheForScope = options.cacheForScope;
+    let generations = options.generations;
+    let scopeIdentity = options.scopeIdentity;
+    let deferredJournal = internals?.deferredJournal ?? options.deferredJournal;
+    if (internals === undefined && options.transport === undefined) {
+      const configuredCache = Object.values(definition.tables).some((table) => table.cache !== undefined);
+      generations ??= createAppsScriptGenerationStore();
+      deferredJournal ??= createAppsScriptDeferredJournal();
+      if (configuredCache) {
+        const caches = new Map<AppsScriptCacheScope, ChunkedCache>();
+        cacheForScope ??= (scope) => {
+          let cache = caches.get(scope);
+          if (cache === undefined) {
+            cache = createAppsScriptChunkedCache({ scope });
+            caches.set(scope, cache);
+          }
+          return cache;
+        };
+        scopeIdentity ??= (scope) => {
+          if (scope === "user") return Session.getTemporaryActiveUserKey();
+          if (scope === "document") return this.activeResolver?.() ?? SpreadsheetApp.getActiveSpreadsheet().getId();
+          return ScriptApp.getScriptId();
+        };
+      }
+    }
+    this.executor = internals?.executor ?? new GQueryExecutor(definition, {
+      ...options,
+      transport,
+      executionScope: options.executionScope ?? defaultScope,
+      cacheForScope,
+      generations,
+      scopeIdentity,
+      deferredJournal,
+    });
+    this.generations = internals?.generations ?? generations;
+    this.systemHooks = internals?.systemHooks ?? options.systemHooks;
+    this.deferredJournal = deferredJournal;
+    this.deferredDeadLetters = internals?.deferredDeadLetters ?? options.deferredDeadLetters;
+    this.deferredAppliedReceipts = internals?.deferredAppliedReceipts ?? options.deferredAppliedReceipts;
+    this.selectionRuntime = internals?.selectionRuntime ?? this.executor;
+    this.appendOperation = internals?.append ?? ((tableName, rows) => this.executor.append(tableName, rows));
+    const tables: Partial<TableHandles<D>> = {};
+    for (const tableName of Object.keys(definition.tables) as TableNames<D>[]) {
+      (tables as Record<string, unknown>)[tableName] = new TableHandle(this, tableName);
+    }
+    this.tables = Object.freeze(tables as TableHandles<D>);
+    this.raw = Object.freeze({ values: this.createRawValues(transport, options.resolveActiveSpreadsheetId) });
+    this.cache = Object.freeze(new CacheInvalidationManager({
+      definition,
+      generations: this.generations,
+      resolveSourceId: (sourceName) => this.resolveSourceId(sourceName, this.activeResolver),
+    }));
+    this.schema = new SchemaManager({
+      definition,
+      transport,
+      resolveSourceId: (sourceName) => this.resolveSourceId(sourceName as Extract<keyof D["sources"], string>, this.activeResolver),
+    });
+    this.system = new SystemManager({
+      definition,
+      transport,
+      executor: this.executor,
+      generations: this.generations,
+      resolveSourceId: (sourceName) => this.resolveSourceId(sourceName as Extract<keyof D["sources"], string>, this.activeResolver),
+    }, this.systemHooks);
+    this.deferred = new DeferredManager({
+      definition,
+      find: (tableName, key) => {
+        const handle = (this.tables as unknown as Record<string, TableHandle<D, TableNames<D>>>)[tableName];
+        if (handle === undefined) throw new GQueryRuntimeError("INVALID_QUERY", `Unknown deferred table ${tableName}.`);
+        return handle.find(key) as unknown as Selection<Record<string, unknown>>;
+      },
+      append: (tableName, row) => {
+        const handle = (this.tables as unknown as Record<string, TableHandle<D, TableNames<D>>>)[tableName];
+        if (handle === undefined) throw new GQueryRuntimeError("INVALID_QUERY", `Unknown deferred table ${tableName}.`);
+        return handle.append(row as RowAt<D, TableNames<D>>) as MutationResult<Record<string, unknown>>;
+      },
+    }, {
+      journal: this.deferredJournal,
+      deadLetters: this.deferredDeadLetters,
+      appliedReceipts: this.deferredAppliedReceipts,
+    });
+  }
+
+  public batch<const Q extends Readonly<Record<string, Query<any, any, any>>>>(
+    queries: Q,
+  ): BatchQuery<D, Q> {
+    return new BatchQuery(this, Object.freeze({ ...queries }) as Q);
+  }
+
+  public decorateExecutable<T extends AnyRow>(query: ExecutableQuery<T>): ExecutableQuery<T> {
+    if (!(this.selectionRuntime instanceof UnitOfWorkContext)) return query;
+    return {
+      ...query,
+      overlayRows: (tableName, rows) => this.selectionRuntime instanceof UnitOfWorkContext
+        ? this.selectionRuntime.overlayRows(tableName, rows)
+        : rows,
+    };
+  }
+
+  public materialize<T extends AnyRow>(selection: Selection<T>): Selection<T> {
+    if (this.selectionRuntime === this.executor) return selection;
+    return new Selection(
+      selection[SELECTION_INTERNAL].materialized,
+      selection.headers,
+      selection.stats,
+      this.selectionRuntime,
+      selection[SELECTION_INTERNAL].refresh,
+    );
+  }
+
+  public appendRows<T extends AnyRow>(tableName: string, rows: readonly T[]): MutationResult<T> {
+    return this.appendOperation(tableName, rows) as MutationResult<T>;
+  }
+
+  public commitIntents(
+    intents: readonly UnitOfWorkIntent[],
+    constraintSnapshots: readonly WriteConstraintSnapshot[] = [],
+  ): Omit<UnitOfWorkCommitResult, "status"> & {
+    readonly status: UnitOfWorkCommitResult["status"] | "queued";
+  } {
+    if (this.selectionRuntime instanceof UnitOfWorkContext) {
+      this.selectionRuntime.stageIntents(intents, constraintSnapshots);
+      return {
+        status: "queued",
+        conflicts: [],
+        workbooks: [],
+        stats: createExecutionStats(),
+      };
+    }
+    return this.executor.commitUnitOfWorkWithSnapshots(intents, constraintSnapshots);
+  }
+
+  public unitOfWork<T>(
+    options: UnitOfWorkOptions,
+    callback: (transaction: GQuery<D>) => T,
+  ): UnitOfWorkResult<T>;
+  public unitOfWork<T>(callback: (transaction: GQuery<D>) => T): UnitOfWorkResult<T>;
+  public unitOfWork<T>(
+    optionsOrCallback: UnitOfWorkOptions | ((transaction: GQuery<D>) => T),
+    maybeCallback?: (transaction: GQuery<D>) => T,
+  ): UnitOfWorkResult<T> {
+    const options = typeof optionsOrCallback === "function" ? {} : optionsOrCallback;
+    const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+    if (callback === undefined) throw new TypeError("unitOfWork() requires a callback.");
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const lock = typeof options.lock === "object"
+      ? options.lock
+      : nativeLock(options.lock ?? "auto");
+    const lockStartedAt = Date.now();
+    if (lock !== null && !lock.tryAcquire(timeoutMs)) {
+      throw new GQueryRuntimeError("MUTATION_CONFLICT", `Could not acquire the unit-of-work lock within ${timeoutMs}ms.`);
+    }
+    const lockWaitMs = Date.now() - lockStartedAt;
+    try {
+      const context = new UnitOfWorkContext(this.executor);
+      const transaction = attachTableProperties(new GQueryDatabase(this.definition, {}, {
+        executor: this.executor,
+        transport: this.transport,
+        selectionRuntime: context,
+        append: (tableName, rows) => context.append(tableName, rows),
+        resolveActiveSpreadsheetId: this.activeResolver,
+        generations: this.generations,
+        systemHooks: this.systemHooks,
+        deferredJournal: this.deferredJournal,
+        deferredDeadLetters: this.deferredDeadLetters,
+        deferredAppliedReceipts: this.deferredAppliedReceipts,
+      })) as GQuery<D>;
+      const value = callback(transaction);
+      const committed = context.commit();
+      return {
+        ...committed,
+        value,
+        lockWaitMs,
+        stats: { ...committed.stats, lockWaitMs },
+      };
+    } finally {
+      lock?.release();
+    }
+  }
+
+  public resolveSourceId(sourceName: Extract<keyof D["sources"], string>, resolver?: () => string): string {
+    const source = this.definition.sources[sourceName];
+    if (source.kind === "spreadsheet-id") return source.spreadsheetId;
+    try {
+      return resolver?.() ?? SpreadsheetApp.getActiveSpreadsheet().getId();
+    } catch (cause) {
+      throw new GQueryRuntimeError("SOURCE_UNAVAILABLE", "The active spreadsheet source is unavailable.", { cause });
+    }
+  }
+
+  private createRawValues(
+    transport: SheetsTransport,
+    resolver?: () => string,
+  ): RawValuesApi<D["sources"]> {
+    type SourceName = Extract<keyof D["sources"], string>;
+    const api: RawValuesApi<D["sources"]> = {
+      get: (sourceName: SourceName, range: string, readOptions?: SheetReadOptions) =>
+        transport.get(this.resolveSourceId(sourceName, resolver), range, readOptions),
+      batchGet: (sourceName: SourceName, ranges: readonly string[], readOptions?: SheetReadOptions) =>
+        transport.batchGet(this.resolveSourceId(sourceName, resolver), ranges, readOptions),
+      batchUpdate: (
+        sourceName: SourceName,
+        updates: readonly SheetValueUpdate[],
+        writeOptions?: SheetBatchUpdateOptions,
+      ) => transport.batchUpdate(this.resolveSourceId(sourceName, resolver), updates, writeOptions),
+      atomicBatchUpdate: (sourceName: SourceName, mutations: readonly AtomicMutation[]) => {
+        transport.atomicBatchUpdate(this.resolveSourceId(sourceName, resolver), mutations);
+      },
+    };
+    return Object.freeze(api);
+  }
+}
+
+export type GQuery<D extends DatabaseDefinition> = GQueryDatabase<D> & TableHandles<D>;
+
+const RESERVED_PROPERTIES = new Set([
+  "definition",
+  "executor",
+  "tables",
+  "raw",
+  "batch",
+  "unitOfWork",
+  "schema",
+  "system",
+  "deferred",
+  "cache",
+  "decorateExecutable",
+]);
+
+/** Create lazy typed table handles without opening any spreadsheet. */
+export function createGQuery<const D extends DatabaseDefinition>(
+  definition: D,
+  options: CreateGQueryOptions = {},
+): GQuery<D> {
+  return attachTableProperties(new GQueryDatabase(definition, options)) as GQuery<D>;
+}
+
+function attachTableProperties<D extends DatabaseDefinition>(
+  database: GQueryDatabase<D>,
+): GQueryDatabase<D> & TableHandles<D> {
+  const definition = database.definition;
+  for (const tableName of Object.keys(definition.tables) as TableNames<D>[]) {
+    if (RESERVED_PROPERTIES.has(tableName)) {
+      throw new GQueryRuntimeError(
+        "INVALID_QUERY",
+        `Table name ${tableName} is reserved. Use a different schema property name.`,
+      );
+    }
+    Object.defineProperty(database, tableName, {
+      value: database.tables[tableName],
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return database as GQueryDatabase<D> & TableHandles<D>;
+}

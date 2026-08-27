@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { GQuery, quoteSheetName, sheetNameFromRange, sheetRange } from "./index";
+import { GQuery, quoteSheetName, sheetNameFromRange, sheetRange } from "./legacy";
 
 describe("A1 sheet names", () => {
   beforeEach(() => {

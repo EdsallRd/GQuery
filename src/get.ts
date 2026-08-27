@@ -1,4 +1,4 @@
-import { GQuery, GQueryTable, GQueryTableFactory } from "./index";
+import { GQuery, GQueryTable, GQueryTableFactory } from "./legacy";
 import { callHandler } from "./ratelimit";
 import {
   GQueryReadOptions,
@@ -10,7 +10,6 @@ import {
   DateTimeRenderOption,
 } from "./types";
 import { convertRowTypes, normalizeForSchema, parseRows } from "./utils";
-import { normalizeForSchema, parseRows } from "./utils";
 import { sheetRange } from "./a1";
 
 /**

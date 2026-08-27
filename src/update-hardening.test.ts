@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { GQuery } from "./index";
+import { GQuery } from "./legacy";
 
 describe("update hardening", () => {
   beforeEach(() => {

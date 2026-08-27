@@ -1,4 +1,4 @@
-import { GQueryTableFactory } from "./index";
+import { GQueryTableFactory } from "./legacy";
 import { callHandler } from "./ratelimit";
 import {
   GQueryResult,
