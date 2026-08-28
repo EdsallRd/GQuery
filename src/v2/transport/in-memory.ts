@@ -19,11 +19,16 @@ import type {
 import { parseA1Range } from "./a1";
 import { isFormulaCell } from "../codecs";
 import { cloneRawMatrix, cloneSheetInputMatrix } from "./raw-values";
+import {
+  assertAtomicBatchPayloadSize,
+  atomicMutationToSheetsRequest,
+} from "./atomic-request";
 
 export interface InMemorySheetSeed {
   sheetId: number;
   title: string;
   values?: readonly (readonly SheetCellInput[])[];
+  hasFullSheetProtection?: boolean;
 }
 
 export interface InMemorySpreadsheetSeed {
@@ -43,6 +48,7 @@ interface MemorySheet {
   sheetId: number;
   title: string;
   values: SheetCellInput[][];
+  hasFullSheetProtection?: boolean;
 }
 
 interface MemorySpreadsheet {
@@ -55,6 +61,9 @@ function cloneSheet(sheet: MemorySheet): MemorySheet {
     sheetId: sheet.sheetId,
     title: sheet.title,
     values: sheet.values.map((row) => [...row]),
+    ...(sheet.hasFullSheetProtection === undefined
+      ? {}
+      : { hasFullSheetProtection: sheet.hasFullSheetProtection }),
   };
 }
 
@@ -86,6 +95,9 @@ function validateSeed(seed: InMemorySpreadsheetSeed): MemorySpreadsheet {
       sheetId: sheet.sheetId,
       title: sheet.title,
       values: cloneSheetInputMatrix(sheet.values ?? [], `seed ${sheet.title}`),
+      ...(sheet.hasFullSheetProtection === undefined
+        ? {}
+        : { hasFullSheetProtection: sheet.hasFullSheetProtection }),
     };
   });
   return { spreadsheetId: seed.spreadsheetId, sheets };
@@ -219,6 +231,9 @@ export class InMemorySheetsTransport implements SheetsTransport {
         title: sheet.title,
         rowCount: sheet.values.length,
         columnCount: maxWidth(sheet.values),
+        ...(sheet.hasFullSheetProtection === undefined
+          ? {}
+          : { hasFullSheetProtection: sheet.hasFullSheetProtection }),
       })),
     };
   }
@@ -364,7 +379,10 @@ export class InMemorySheetsTransport implements SheetsTransport {
     mutations: readonly AtomicMutation[],
     options: AtomicBatchUpdateOptions = {},
   ): AtomicBatchUpdateResult {
-    void options;
+    assertAtomicBatchPayloadSize(
+      mutations.map(atomicMutationToSheetsRequest),
+      options,
+    );
     this.record({
       kind: "atomicBatchUpdate",
       spreadsheetId,
@@ -392,6 +410,21 @@ export class InMemorySheetsTransport implements SheetsTransport {
         const matrix = cloneSheetInputMatrix(mutation.values, "atomic append values");
         if (matrix.length === 0) throw new TypeError("Atomic append cannot be empty.");
         writeMatrix(sheet, sheet.values.length, 0, matrix);
+      } else if (mutation.kind === "formatCells") {
+        if (
+          !Number.isSafeInteger(mutation.startRowIndex) ||
+          !Number.isSafeInteger(mutation.startColumnIndex) ||
+          !Number.isSafeInteger(mutation.rowCount) ||
+          !Number.isSafeInteger(mutation.columnCount) ||
+          mutation.startRowIndex < 0 ||
+          mutation.startColumnIndex < 0 ||
+          mutation.rowCount < 1 ||
+          mutation.columnCount < 1
+        ) {
+          throw new RangeError("Atomic format range is outside the grid bounds.");
+        }
+        // The in-memory transport models values, not presentation. Compiling
+        // the request above still validates the format mutation shape.
       } else {
         if (
           !Number.isSafeInteger(mutation.startRowIndex) ||

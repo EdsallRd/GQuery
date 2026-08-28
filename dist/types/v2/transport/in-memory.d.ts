@@ -3,6 +3,7 @@ export interface InMemorySheetSeed {
     sheetId: number;
     title: string;
     values?: readonly (readonly SheetCellInput[])[];
+    hasFullSheetProtection?: boolean;
 }
 export interface InMemorySpreadsheetSeed {
     spreadsheetId: string;

@@ -43,6 +43,8 @@ interface CodecContext {
     readonly column?: string;
     readonly header?: string;
     readonly rowNumber?: number;
+    /** Set to false after an explicit canonical-only migration cutover. */
+    readonly allowLegacy?: boolean;
 }
 interface ColumnCodec<T> {
     readonly kind: string;
@@ -61,6 +63,8 @@ interface ColumnDefinition<T> extends ColumnCodec<T> {
     readonly legacyDecoders: readonly LegacyDecoder<T>[];
     readonly blankPolicy: "reject" | "null" | "undefined" | "default";
     readonly acceptsNull: boolean;
+    /** Decode using only canonical encodings, including through wrapper codecs. */
+    decodeCanonical(value: unknown, context?: CodecContext): T;
 }
 type InferColumn<C> = C extends {
     readonly __gqueryColumn: true;
@@ -194,6 +198,7 @@ interface TableCacheDefinition<Columns extends ColumnMap = ColumnMap> {
     readonly ttlSeconds: number;
     readonly jitterSeconds?: number;
     readonly indexes?: readonly (readonly ColumnKey<Columns>[])[];
+    readonly tags?: readonly string[];
     readonly allowStaleOnQuota?: boolean;
 }
 type NonEmptyKey<Columns extends ColumnMap> = readonly [
@@ -225,6 +230,7 @@ type TableInput = {
         readonly ttlSeconds: number;
         readonly jitterSeconds?: number;
         readonly indexes?: readonly (readonly string[])[];
+        readonly tags?: readonly string[];
         readonly allowStaleOnQuota?: boolean;
     };
     readonly appendOnly?: boolean;
@@ -333,6 +339,8 @@ type FieldOperators<V> = {
     $startsWith?: V extends string ? string : never;
     $endsWith?: V extends string ? string : never;
     $isBlank?: boolean;
+    /** Matches decoded logical null only; unlike $isBlank it does not match "" or undefined. */
+    $isNull?: boolean;
 };
 type Where<T extends Record<string, unknown>> = {
     [K in keyof T]?: T[K] | FieldOperators<T[K]>;
@@ -341,7 +349,7 @@ type Where<T extends Record<string, unknown>> = {
     $or?: readonly Where<T>[];
     $not?: Where<T>;
 };
-type PredicateOperator = "eq" | "ne" | "in" | "notIn" | "gt" | "gte" | "lt" | "lte" | "between" | "contains" | "startsWith" | "endsWith" | "isBlank";
+type PredicateOperator = "eq" | "ne" | "in" | "notIn" | "gt" | "gte" | "lt" | "lte" | "between" | "contains" | "startsWith" | "endsWith" | "isBlank" | "isNull";
 type PredicateNode = {
     kind: "field";
     field: string;
@@ -433,6 +441,8 @@ interface ExecutionStats {
     elapsedMs: number;
     lockWaitMs: number;
     fullScans: number;
+    /** Additional related rows beyond one match per base row. */
+    joinFanOut: number;
     rangesRead: string[];
     rangesWritten: string[];
 }
@@ -463,6 +473,8 @@ declare function cellRange(sheetName: string, startRowIndex: number, startColumn
 type SheetCellValue = string | number | boolean | null;
 /** Typed input accepted only by grid writes that preserve formula intent. */
 type SheetCellInput = SheetCellValue | FormulaCell;
+/** Google Sheets `CellFormat` payload retained as a transport-neutral object. */
+type SheetCellFormat = Readonly<Record<string, unknown>>;
 type SheetMajorDimension = "ROWS" | "COLUMNS";
 type SheetValueRenderOption = "FORMATTED_VALUE" | "UNFORMATTED_VALUE" | "FORMULA";
 type SheetDateTimeRenderOption = "SERIAL_NUMBER" | "FORMATTED_STRING";
@@ -486,6 +498,11 @@ interface SheetMetadata {
     title: string;
     rowCount: number;
     columnCount: number;
+    /**
+     * Whether a non-warning protected range covers the complete sheet. `undefined`
+     * means the transport cannot report protection state.
+     */
+    hasFullSheetProtection?: boolean;
 }
 interface SpreadsheetMetadata {
     spreadsheetId: string;
@@ -535,6 +552,18 @@ interface AtomicRowAppend {
     kind: "appendRows";
     sheetId: number;
     values: readonly (readonly SheetCellInput[])[];
+    /** Optional formats aligned with `values`; omitted cells keep defaults. */
+    formats?: readonly (readonly (SheetCellFormat | null)[])[];
+}
+/** Apply one format to a rectangular range without changing cell values. */
+interface AtomicCellFormat {
+    kind: "formatCells";
+    sheetId: number;
+    startRowIndex: number;
+    startColumnIndex: number;
+    rowCount: number;
+    columnCount: number;
+    format: SheetCellFormat;
 }
 /** A zero-based, end-exclusive row deletion. */
 interface AtomicRowDelete {
@@ -543,7 +572,7 @@ interface AtomicRowDelete {
     startRowIndex: number;
     endRowIndex: number;
 }
-type AtomicMutation = AtomicCellUpdate | AtomicRowAppend | AtomicRowDelete;
+type AtomicMutation = AtomicCellUpdate | AtomicRowAppend | AtomicCellFormat | AtomicRowDelete;
 interface AtomicBatchUpdateOptions {
     includeSpreadsheetInResponse?: boolean;
     responseIncludeGridData?: boolean;
@@ -580,13 +609,20 @@ interface SheetsTransport {
     atomicBatchUpdate(spreadsheetId: string, mutations: readonly AtomicMutation[], options?: AtomicBatchUpdateOptions): AtomicBatchUpdateResult;
 }
 
+/** Safety ceiling below the Sheets API's recommended 2 MB request size. */
+declare const ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT = 1800000;
+/** Compile a transport-neutral atomic mutation into a Sheets batchUpdate request. */
+declare function atomicMutationToSheetsRequest(mutation: AtomicMutation): GoogleAppsScript.Sheets.Schema.Request;
+declare function utf8ByteLength(value: string): number;
+/** Reject a request before an oversized atomic commit can reach the API. */
+declare function assertAtomicBatchPayloadSize(requests: readonly GoogleAppsScript.Sheets.Schema.Request[], options?: AtomicBatchUpdateOptions): number;
+
 interface AppsScriptSheetsTransportOptions {
     /** Override the global advanced Sheets service, primarily for tests. */
     service?: GoogleAppsScript.Sheets;
     /** Synchronous deadline/retry/telemetry interception point. */
     invoker?: TransportInvoker;
 }
-declare function atomicMutationToSheetsRequest(mutation: AtomicMutation): GoogleAppsScript.Sheets.Schema.Request;
 declare class AppsScriptSheetsTransport implements SheetsTransport {
     private readonly injectedService?;
     private readonly invoker?;
@@ -624,6 +660,7 @@ interface InMemorySheetSeed {
     sheetId: number;
     title: string;
     values?: readonly (readonly SheetCellInput[])[];
+    hasFullSheetProtection?: boolean;
 }
 interface InMemorySpreadsheetSeed {
     spreadsheetId: string;
@@ -716,16 +753,34 @@ interface RowProvenance {
     readonly headerFingerprint: string;
     readonly readAt: string;
     readonly relations: Readonly<Record<string, readonly RowProvenance[]>>;
+    /** Declared/planned cardinality is retained even when a relation matched 0 or 1 rows. */
+    readonly relationCardinalities: Readonly<Record<string, "one" | "many">>;
+    /** Base-table fields whose values selected each materialized relation alias. */
+    readonly relationLocalFields?: Readonly<Record<string, readonly string[]>>;
+    /**
+     * Marks rows whose visible value includes durable write-behind state that is
+     * not yet authoritative in Sheets. Virtual rows have no physical row at all.
+     */
+    readonly deferredOverlay?: {
+        readonly mutationIds: readonly string[];
+        readonly fields: readonly string[];
+        readonly virtual: boolean;
+    };
 }
 interface MaterializedRow<T extends Record<string, unknown>> {
     readonly value: T;
     readonly provenance: RowProvenance;
 }
 declare function cloneProvenance(provenance: RowProvenance, changes?: Partial<RowProvenance>): RowProvenance;
+/**
+ * Remove joined values whose lookup key was changed by a base-row mutation.
+ * The remaining aliases keep their exact physical relation provenance.
+ */
+declare function invalidateChangedRelations<T extends Record<string, unknown>>(item: MaterializedRow<T>, changedFields: readonly string[]): MaterializedRow<T>;
 
 type MutationStatus = "committed" | "queued" | "conflicted";
 interface MutationConflict {
-    readonly code: "missing" | "key-changed" | "version-changed" | "schema-changed" | "duplicate-key";
+    readonly code: "missing" | "key-changed" | "version-changed" | "schema-changed" | "duplicate-key" | "foreign-key-missing";
     readonly table: string;
     readonly key: Readonly<Record<string, unknown>>;
     readonly rowIndex?: number;
@@ -775,6 +830,15 @@ interface SelectionInternal<T extends Record<string, unknown>> {
     readonly refresh: (() => Selection<T>) | null;
     readonly fanoutRequired: boolean;
 }
+type SelectionJsonValue = null | boolean | number | string | readonly SelectionJsonValue[] | {
+    readonly [key: string]: SelectionJsonValue;
+};
+interface SelectionJSON {
+    readonly headers: readonly string[];
+    readonly rows: readonly {
+        readonly [key: string]: SelectionJsonValue;
+    }[];
+}
 type RelatedRow<Value> = NonNullable<Value> extends readonly (infer Item)[] ? Extract<Item, Record<string, unknown>> : Extract<NonNullable<Value>, Record<string, unknown>>;
 /**
  * An immutable result set. Its public data is serializable; physical row
@@ -787,10 +851,7 @@ declare class Selection<T extends Record<string, unknown>> {
     readonly [SELECTION_INTERNAL]: SelectionInternal<T>;
     constructor(materialized: readonly MaterializedRow<T>[], headers: readonly (keyof T & string)[], stats: ExecutionStats, runtime: SelectionRuntime, refresh?: (() => Selection<T>) | null, fanoutRequired?: boolean);
     get length(): number;
-    toJSON(): {
-        readonly headers: readonly (keyof T & string)[];
-        readonly rows: readonly Readonly<T>[];
-    };
+    toJSON(): SelectionJSON;
     refresh(): Selection<T>;
     update(patch: MutationPatch<T>, options?: MutationOptions): MutationResult<T>;
     delete(options?: DeleteOptions): MutationResult<T>;
@@ -994,12 +1055,15 @@ interface AppsScriptChunkedCacheOptions {
 declare function createAppsScriptChunkedCache(options?: AppsScriptChunkedCacheOptions): ChunkedCache;
 declare function createAppsScriptGenerationStore(namespace?: string): GenerationTokenStore;
 
-type GQueryErrorCode = "API_RATE_LIMIT" | "API_SERVER" | "API_NETWORK" | "API_DEADLINE" | "API_FAILURE" | "DEADLINE_EXCEEDED" | "RETRY_EXHAUSTED" | "AMBIGUOUS_COMMIT" | "CACHE_CORRUPT" | "CACHE_CONFIGURATION" | "JOURNAL_CAPACITY" | "JOURNAL_ENTRY_TOO_LARGE" | "JOURNAL_CORRUPT" | "JOURNAL_LOCK_TIMEOUT" | "DEFERRED_CONFLICT";
+type GQueryErrorCode = "API_RATE_LIMIT" | "API_SERVER" | "API_NETWORK" | "API_DEADLINE" | "API_FAILURE" | "DEADLINE_EXCEEDED" | "RETRY_EXHAUSTED" | "AMBIGUOUS_COMMIT" | "CACHE_CORRUPT" | "CACHE_CONFIGURATION" | "JOURNAL_CAPACITY" | "JOURNAL_ENTRY_TOO_LARGE" | "JOURNAL_CORRUPT" | "JOURNAL_LOCK_TIMEOUT" | "DEFERRED_CONFLICT" | "REQUEST_TOO_LARGE";
 declare class GQueryV2Error extends Error {
     readonly code: GQueryErrorCode;
     readonly details: Readonly<Record<string, unknown>>;
     readonly cause?: unknown;
     constructor(code: GQueryErrorCode, message: string, details?: Readonly<Record<string, unknown>>, cause?: unknown);
+}
+declare class RequestPayloadTooLargeError extends GQueryV2Error {
+    constructor(operationKind: string, bytes: number, maximumBytes: number);
 }
 type ApiFailureKind = "rate-limit" | "server" | "network" | "deadline" | "non-retryable";
 interface ApiFailureDetails {
@@ -1071,15 +1135,25 @@ declare class JournalCorruptionError extends GQueryV2Error {
 declare class JournalLockTimeoutError extends GQueryV2Error {
     constructor(timeoutMs: number);
 }
+declare class JournalFlushLeaseLostError extends GQueryV2Error {
+    constructor(leaseId: string);
+}
 declare class IdempotencyConflictError extends GQueryV2Error {
     constructor(idempotencyKey: string);
+}
+declare class AppliedReceiptCapacityError extends GQueryV2Error {
+    constructor(sourceMutationCount: number, retainedReceiptLimit: number, bytes: number, maximumBytes: number);
 }
 interface DeferredOverlayPublisher {
     /** Cache-only optimization. Implementations must treat replace failures as recoverable. */
     replace(entries: readonly PendingDeferredMutation[]): void;
 }
+interface DeferredOverlayReader {
+    /** Returns null after eviction/corruption so callers can rebuild from the journal. */
+    read(): readonly PendingDeferredMutation[] | null;
+}
 /** CacheService-backed overlay which remains explicitly rebuildable from the journal. */
-declare class ChunkedDeferredOverlay implements DeferredOverlayPublisher {
+declare class ChunkedDeferredOverlay implements DeferredOverlayPublisher, DeferredOverlayReader {
     private readonly cache;
     private readonly logicalKey;
     private readonly policy;
@@ -1094,6 +1168,18 @@ interface DeferredJournalOptions {
     readonly maxMutationBytes?: number;
     readonly retainedReceiptLimit?: number;
     readonly lockTimeoutMs?: number;
+    /**
+     * Durable trigger-run fence. The default exceeds Apps Script's normal
+     * six-minute execution ceiling so a healthy flush cannot be overtaken.
+     */
+    readonly flushLeaseMs?: number;
+}
+interface AppliedMutationReceiptLedgerOptions {
+    readonly namespace?: string;
+    readonly retainedReceiptLimit?: number;
+    readonly maximumBytes?: number;
+    readonly maximumAgeMs?: number;
+    readonly clock?: Clock;
 }
 interface DeferredJournalDependencies {
     readonly properties: PropertyStore;
@@ -1106,6 +1192,8 @@ interface DeferredJournalDependencies {
 interface CoalescedDeferredMutation {
     readonly id: string;
     readonly sourceMutationIds: readonly string[];
+    /** Original ordered operations retained for crash-safe partial recomposition. */
+    readonly sourceMutations: readonly PendingDeferredMutation[];
     readonly sourceId: string;
     readonly table: string;
     readonly kind: DeferredMutationKind;
@@ -1114,6 +1202,8 @@ interface CoalescedDeferredMutation {
     readonly expectedVersion?: string | number | null;
     readonly actor?: string;
     readonly firstSequence: number;
+    /** Encoded state written by a confirmed applied prefix of this group. */
+    readonly recoveryAppliedValues?: Readonly<Record<string, unknown>>;
 }
 type DeferredOutcomeStatus = "committed" | "transient" | "conflict";
 interface DeferredMutationOutcome {
@@ -1128,6 +1218,8 @@ interface DeferredMutationBatchExecutor {
      * more than once must be harmless because a crash can follow a remote commit.
      */
     apply(mutations: readonly CoalescedDeferredMutation[]): readonly DeferredMutationOutcome[];
+    /** Called only after terminal journal removal has been durably published. */
+    forgetApplied?(mutationIds: readonly string[]): void;
 }
 interface DeferredDeadLetter {
     readonly id: string;
@@ -1140,6 +1232,8 @@ interface DeferredDeadLetterSink {
     /** Must be idempotent by dead-letter id because persistence can fail after this call. */
     write(records: readonly DeferredDeadLetter[]): void;
 }
+declare const DEFERRED_DEAD_LETTER_BASE_HEADERS: readonly ["ID", "Mutation ID", "Source", "Table", "Key", "Conflict", "Moved At"];
+declare const DEFERRED_DEAD_LETTER_ACTOR_HEADER = "Actor";
 interface DeferredFlushResult {
     readonly attempted: number;
     readonly committed: number;
@@ -1148,7 +1242,46 @@ interface DeferredFlushResult {
     readonly coalesced: number;
     readonly errors: readonly string[];
 }
-/** Only semantically compatible adjacent operations are combined; ordering is otherwise preserved. */
+interface AppliedMutationReceipt {
+    readonly mutationId: string;
+    readonly appliedAtMs: number;
+}
+/**
+ * A compact crash-recovery ledger. It uses one bounded ScriptProperties value,
+ * not one permanent property per mutation, and terminal journal publication
+ * removes entries eagerly.
+ */
+declare class AppliedMutationReceiptLedger {
+    private readonly properties;
+    private readonly namespace;
+    private readonly retainedReceiptLimit;
+    private readonly maximumBytes;
+    private readonly maximumAgeMs;
+    private readonly clock;
+    constructor(properties: PropertyStore, options?: AppliedMutationReceiptLedgerOptions);
+    has(mutationId: string): boolean;
+    mark(mutationId: string): void;
+    /** Publish all receipts in one bounded property write after an atomic batch. */
+    markMany(mutationIds: readonly string[]): void;
+    /** Refuse a flush before remote I/O when its full crash checkpoint cannot fit. */
+    assertCanMarkMany(mutationIds: readonly string[]): void;
+    forget(mutationIds: readonly string[]): void;
+    prune(): number;
+    list(): readonly AppliedMutationReceipt[];
+    private get key();
+    private load;
+    private pruned;
+    private fit;
+    private markedState;
+    private serializedBytes;
+    private persist;
+}
+/**
+ * Combine compatible operations for one key even when unrelated keys are
+ * interleaved. The first occurrence retains its position, field values remain
+ * last-write-wins for that key, and an incompatible operation on the same key
+ * creates a semantic barrier for subsequent entries.
+ */
 declare function coalesceDeferredMutations(entries: readonly PendingDeferredMutation[], hasher: HashFunction): CoalescedDeferredMutation[];
 /** Durable, bounded ScriptProperties journal. Cache overlays are deliberately non-authoritative. */
 declare class DeferredJournal {
@@ -1160,13 +1293,30 @@ declare class DeferredJournal {
     private readonly maxMutationBytes;
     private readonly retainedReceiptLimit;
     private readonly lockTimeoutMs;
+    private readonly flushLeaseMs;
     constructor(dependencies: DeferredJournalDependencies, options?: DeferredJournalOptions);
     enqueue(input: DeferredMutationInput): DeferredEnqueueResult;
     enqueueOrExecute(input: DeferredMutationInput, immediate: () => PendingMutationReceipt): DeferredEnqueueResult;
     list(): readonly PendingDeferredMutation[];
+    /** Read the authoritative journal and republish its cache-only overlay in one lock. */
+    listAndRebuildOverlay(): readonly PendingDeferredMutation[];
+    /**
+     * Read a manifest-last snapshot without taking the journal ScriptLock.
+     *
+     * This path is used only to rebuild the non-authoritative read-your-writes
+     * overlay. A query can already be running under the unit-of-work/document
+     * lock, so acquiring a second ScriptLock handle here risks a nested-lock
+     * timeout in Apps Script. The immutable shard generation is safe to read
+     * lock-free as long as the manifest remains unchanged for the duration of
+     * the read. A concurrent publication is retried against its new generation.
+     */
+    readAndRebuildOverlay(): readonly PendingDeferredMutation[];
     receipt(idempotencyKey: string): PendingMutationReceipt | null;
     rebuildOverlay(): number;
     flush(executor: DeferredMutationBatchExecutor, deadLetters: DeferredDeadLetterSink): DeferredFlushResult;
+    private prepareFlush;
+    private reconcileFlush;
+    private releaseFlushLease;
     private locked;
     private get manifestKey();
     private shardKey;
@@ -1176,10 +1326,221 @@ declare class DeferredJournal {
 }
 declare function createAppsScriptDeferredJournal(options?: DeferredJournalOptions, overlay?: DeferredOverlayPublisher): DeferredJournal;
 
+type SchemaIssueCode = "MISSING_SHEET" | "MISSING_HEADER" | "MISSING_VERSION_COLUMN" | "INVALID_VERSION" | "DUPLICATE_HEADER" | "INVALID_CELL" | "LEGACY_ENCODING" | "DUPLICATE_PRIMARY_KEY" | "DUPLICATE_UNIQUE_KEY" | "RELATION_CARDINALITY" | "BROKEN_RELATION" | "INVALID_SYSTEM_SHEET" | "UNPROTECTED_SYSTEM_SHEET";
+type SystemCellRepairValue = {
+    readonly kind: "literal";
+    readonly value: string;
+} | {
+    readonly kind: "backup-id";
+} | {
+    readonly kind: "migration-time";
+};
+interface SchemaIssue {
+    readonly code: SchemaIssueCode;
+    readonly severity: "info" | "warning" | "error";
+    readonly source: string;
+    readonly spreadsheetId: string;
+    readonly table: string;
+    readonly sheet: string;
+    readonly row?: number;
+    readonly column?: string;
+    readonly header?: string;
+    readonly message: string;
+}
+type SchemaMigrationAction = {
+    readonly kind: "add-version-column";
+    readonly spreadsheetId: string;
+    readonly table: string;
+    readonly sheet: string;
+    readonly sheetId: number;
+    readonly header: string;
+    readonly columnIndex: number;
+    /** Zero-based physical rows which contain actual table data. */
+    readonly populatedRowIndexes: readonly number[];
+    readonly gridColumnCount: number;
+} | {
+    readonly kind: "create-system-sheet";
+    readonly spreadsheetId: string;
+    readonly sheet: "_gq_meta" | "_gq_dead_letters";
+} | {
+    readonly kind: "add-dead-letter-actor-column";
+    readonly spreadsheetId: string;
+    readonly sheetId: number;
+    readonly columnIndex: number;
+    readonly gridColumnCount: number;
+} | {
+    readonly kind: "repair-system-sheet-cells";
+    readonly spreadsheetId: string;
+    readonly sheet: "_gq_meta" | "_gq_dead_letters";
+    readonly sheetId: number;
+    readonly gridColumnCount: number;
+    readonly cells: readonly {
+        readonly rowIndex: number;
+        readonly columnIndex: number;
+        readonly value: SystemCellRepairValue;
+    }[];
+} | {
+    readonly kind: "protect-system-sheet";
+    readonly spreadsheetId: string;
+    readonly sheet: "_gq_meta" | "_gq_dead_letters";
+    readonly sheetId: number;
+} | {
+    readonly kind: "backfill-cell";
+    readonly spreadsheetId: string;
+    readonly table: string;
+    readonly sheet: string;
+    readonly sheetId: number;
+    readonly rowIndex: number;
+    readonly columnIndex: number;
+    readonly value: SheetCellInput;
+} | {
+    readonly kind: "repair-version-cell";
+    readonly spreadsheetId: string;
+    readonly table: string;
+    readonly sheet: string;
+    readonly sheetId: number;
+    readonly rowIndex: number;
+    readonly columnIndex: number;
+    readonly value: number;
+};
+interface SchemaPlan {
+    readonly schemaVersion: 2;
+    readonly generatedAt: string;
+    readonly issues: readonly SchemaIssue[];
+    readonly actions: readonly SchemaMigrationAction[];
+    readonly backupRequired: boolean;
+    readonly canMigrate: boolean;
+    readonly canonicalCells: number;
+    readonly legacyCells: number;
+    readonly invalidCells: number;
+    /** Deterministic decoded-data summaries for migration/shadow verification. */
+    readonly tables: readonly SchemaTableAudit[];
+}
+interface SchemaTableAudit {
+    readonly source: string;
+    readonly spreadsheetId: string;
+    readonly table: string;
+    readonly sheet: string;
+    readonly decodedRows: number;
+    readonly decodedHash: string;
+}
+interface SchemaMigrationOptions {
+    readonly confirm: true;
+    readonly backupIds?: Readonly<Record<string, string>>;
+    readonly createBackups?: boolean;
+    readonly includeBackfill?: boolean;
+    readonly adapter?: SchemaMigrationAdapter;
+}
+interface SchemaMigrationResult {
+    readonly status: "migrated" | "no-op";
+    readonly backups: Readonly<Record<string, string>>;
+    readonly appliedActions: number;
+    readonly plan: SchemaPlan;
+}
+interface SchemaMigrationAdapter {
+    createBackup(spreadsheetId: string): string;
+    apply(spreadsheetId: string, actions: readonly SchemaMigrationAction[], context: {
+        readonly backupId: string;
+        readonly migratedAt: string;
+    }): void;
+}
+interface SchemaCanonicalState {
+    isStrictCanonical(spreadsheetId: string): boolean;
+    setStrictCanonical(spreadsheetId: string, enabled: boolean): void;
+}
+interface SchemaCanonicalModeAdapter {
+    apply(spreadsheetId: string, enabled: boolean, context: {
+        readonly changedAt: string;
+    }): void;
+}
+interface SchemaCanonicalModeOptions {
+    readonly confirm: true;
+    readonly adapter?: SchemaCanonicalModeAdapter;
+}
+interface SchemaCanonicalModeResult {
+    readonly status: "activated" | "rolled-back" | "no-op";
+    readonly strictCanonical: boolean;
+    readonly spreadsheets: readonly string[];
+    readonly plan?: SchemaPlan;
+}
+interface SchemaCanonicalStatus {
+    readonly spreadsheetId: string;
+    readonly strictCanonical: boolean;
+}
+declare class InMemorySchemaCanonicalState implements SchemaCanonicalState {
+    private readonly values;
+    isStrictCanonical(spreadsheetId: string): boolean;
+    setStrictCanonical(spreadsheetId: string, enabled: boolean): void;
+}
+declare function strictCanonicalPropertyKey(spreadsheetId: string): string;
+interface AppsScriptSchemaCanonicalStateOptions {
+    /** Injectable mirror used by tests and non-default Apps Script runtimes. */
+    readonly properties?: PropertyStore;
+    /**
+     * Read the protected `_gq_meta` value. Undefined means the system sheet does
+     * not exist yet, so dual decoding remains enabled.
+     */
+    readonly readMeta?: (spreadsheetId: string) => boolean | undefined;
+}
+declare class AppsScriptSchemaCanonicalState implements SchemaCanonicalState {
+    private readonly options;
+    /** One authoritative system-sheet read per workbook and Apps Script execution. */
+    private readonly resolved;
+    constructor(options?: AppsScriptSchemaCanonicalStateOptions);
+    isStrictCanonical(spreadsheetId: string): boolean;
+    setStrictCanonical(spreadsheetId: string, enabled: boolean): void;
+    private properties;
+    private readMeta;
+}
+interface SchemaManagementAccess {
+    readonly definition: DatabaseDefinition;
+    readonly transport: SheetsTransport;
+    readonly canonicalState?: SchemaCanonicalState;
+    resolveSourceId(sourceName: string): string;
+    invalidateStructure?(spreadsheetId: string): void;
+    invalidateTable?(spreadsheetId: string, tableName: string): void;
+}
+/** Read-only audit plus explicit, backup-gated schema migration. */
+declare class SchemaManager {
+    private readonly access;
+    private readonly canonicalState;
+    constructor(access: SchemaManagementAccess);
+    strictCanonicalStatus(): readonly SchemaCanonicalStatus[];
+    /**
+     * Enable canonical-only decoding only after a fresh audit proves that no
+     * legacy cells, invalid cells, or unapplied migration actions remain.
+     */
+    activateStrictCanonical(options: SchemaCanonicalModeOptions): SchemaCanonicalModeResult;
+    /** Disable canonical-only decoding as the documented rollback switch. */
+    rollbackStrictCanonical(options: SchemaCanonicalModeOptions): SchemaCanonicalModeResult;
+    plan(): SchemaPlan;
+    migrate(options: SchemaMigrationOptions): SchemaMigrationResult;
+    private spreadsheetIds;
+    private setStrictCanonical;
+    private loadTables;
+    private auditSystemSheet;
+    private issue;
+}
+/** Persist the canonical-mode switch in the protected `_gq_meta` sheet. */
+declare class AppsScriptSchemaCanonicalModeAdapter implements SchemaCanonicalModeAdapter {
+    apply(spreadsheetId: string, enabled: boolean, context: {
+        readonly changedAt: string;
+    }): void;
+}
+/** Default Apps Script migration adapter. It is used only by explicit migrate(). */
+declare class AppsScriptSchemaMigrationAdapter implements SchemaMigrationAdapter {
+    createBackup(spreadsheetId: string): string;
+    apply(spreadsheetId: string, actions: readonly SchemaMigrationAction[], context: {
+        readonly backupId: string;
+        readonly migratedAt: string;
+    }): void;
+}
+
 interface ExecutableQuery<T extends Record<string, unknown>> {
     readonly plan: SerializableQueryPlan;
     readonly localPredicates: readonly ((row: Readonly<T>) => boolean)[];
     readonly refresh: () => Selection<T>;
+    readonly overlayRows?: (tableName: string, rows: readonly MaterializedRow<Record<string, unknown>>[]) => readonly MaterializedRow<Record<string, unknown>>[];
 }
 interface RuntimeCacheAdapter {
     read<T>(key: unknown): {
@@ -1190,15 +1551,26 @@ interface RuntimeCacheAdapter {
         ttlSeconds?: number;
         jitterSeconds?: number;
     }): void;
+    readThrough?<T>(key: unknown, producer: () => T, policy?: {
+        ttlSeconds?: number;
+        jitterSeconds?: number;
+    }): {
+        readonly value: T;
+        readonly cache: "hit" | "hit-after-wait" | "filled" | "uncached";
+    };
 }
 interface RuntimeGenerationAdapter {
     current(dependency: {
         readonly kind: "table";
         readonly sourceId: string;
         readonly table: string;
+    } | {
+        readonly kind: "tag";
+        readonly tag: string;
     }): string;
     invalidateTable(sourceId: string, table: string): string;
     invalidateRow?(sourceId: string, table: string, key: unknown): string;
+    invalidateTag?(tag: string): string;
 }
 interface ExecutorOptions {
     readonly transport: SheetsTransport;
@@ -1209,8 +1581,11 @@ interface ExecutorOptions {
     readonly generations?: RuntimeGenerationAdapter;
     readonly scopeIdentity?: (scope: "script" | "document" | "user") => string | null;
     readonly deferredJournal?: DeferredJournal;
+    readonly deferredOverlay?: DeferredOverlayReader;
+    readonly canonicalState?: SchemaCanonicalState;
     readonly executionScope?: {
         run<T>(operation: () => T): T;
+        retryCount?(): number;
     };
 }
 interface QueryExecution<T extends Record<string, unknown>> {
@@ -1244,36 +1619,66 @@ interface UnitOfWorkCommitResult {
     readonly workbooks: readonly WorkbookCommitReceipt[];
     readonly stats: ExecutionStats;
 }
+/** Internal complete-table snapshot hint used by sync/upsert validation. */
+interface WriteConstraintSnapshot {
+    readonly tableName: string;
+    readonly rows: readonly MaterializedRow<Record<string, unknown>>[];
+}
 /** Purely synchronous schema/query executor over an injectable Sheets transport. */
 declare class GQueryExecutor implements SelectionRuntime {
     private readonly schema;
     private readonly options;
     private readonly metadata;
+    private readonly knownSheets;
+    private readonly knownSheetTitles;
     private readonly headers;
     private readonly locators;
     private readonly now;
+    private deferredOverlaySuppression;
+    private readCacheSuppression;
     constructor(schema: DatabaseDefinition, options: ExecutorOptions);
     execute<T extends Record<string, unknown>>(query: ExecutableQuery<T>): QueryExecution<T>;
+    /** Internal flush hook: deferred delivery must compare against physical state. */
+    withoutDeferredOverlay<T>(operation: () => T): T;
+    /**
+     * Optimistic deferred rows are suitable for reads and further deferred
+     * composition, but never as physical coordinates for an immediate write.
+     */
+    assertNoDeferredOverlayRows(rows: readonly MaterializedRow<Record<string, unknown>>[], operation: string): void;
+    /** Internal flush hook: journal preflight reads must observe physical Sheets state. */
+    withoutReadCache<T>(operation: () => T): T;
     executeBatch(queries: Readonly<Record<string, ExecutableQuery<Record<string, unknown>>>>): {
         readonly selections: Readonly<Record<string, Selection<Record<string, unknown>>>>;
         readonly plans: Readonly<Record<string, ExecutionPlan>>;
     };
     private executeBatchUnscoped;
-    explain<T extends Record<string, unknown>>(query: ExecutableQuery<T>, executedMode?: "bounded" | "full-scan"): ExecutionPlan;
+    explain<T extends Record<string, unknown>>(query: ExecutableQuery<T>, executedMode?: "cache" | "bounded" | "full-scan", executedRanges?: readonly string[], staleTables?: readonly string[]): ExecutionPlan;
     refresh<T extends Record<string, unknown>>(selection: Selection<T>): Selection<T>;
     update<T extends Record<string, unknown>>(selection: Selection<T>, patch: MutationPatch<T>, options?: MutationOptions): MutationResult<T>;
     private updateUnscoped;
     delete<T extends Record<string, unknown>>(selection: Selection<T>, options?: DeleteOptions): MutationResult<T>;
     private deleteUnscoped;
     append(tableName: string, rows: readonly Record<string, unknown>[]): MutationResult<Record<string, unknown>>;
+    /** Queue a caller-keyed create/upsert without opening the spreadsheet. */
+    deferKeyedWrite(tableName: string, row: Readonly<Record<string, unknown>>, kind: "create" | "upsert", options: Pick<MutationOptions, "idempotencyKey" | "actor">): MutationResult<Record<string, unknown>>;
     private appendUnscoped;
     /** Compile staged operations and commit each workbook in one atomic batch. */
     commitUnitOfWork(intents: readonly UnitOfWorkIntent[]): UnitOfWorkCommitResult;
+    commitUnitOfWorkWithSnapshots(intents: readonly UnitOfWorkIntent[], constraintSnapshots?: readonly WriteConstraintSnapshot[]): UnitOfWorkCommitResult;
+    /**
+     * Internal deferred-flush hook. The caller must hold the participating-writer
+     * lock and must have obtained every selection from a cache-bypassing physical
+     * batch read immediately before this call. That read is the targeted version
+     * preflight, so repeating it here would double the Sheets read traffic without
+     * providing compare-and-set semantics (which Sheets does not expose).
+     */
+    commitUnitOfWorkAfterPhysicalRead(intents: readonly UnitOfWorkIntent[], constraintSnapshots?: readonly WriteConstraintSnapshot[]): UnitOfWorkCommitResult;
     private commitUnitOfWorkUnscoped;
     invalidateTable(spreadsheetId: string, tableName: string): void;
     invalidateStructure(spreadsheetId: string): void;
     private emptyMutation;
     private scoped;
+    private attachRetryStats;
     private deferUpdate;
     private deferDelete;
     private prepareUpdates;
@@ -1283,17 +1688,70 @@ declare class GQueryExecutor implements SelectionRuntime {
     private planReferentialDelete;
     private uniqueMaterialized;
     private prepareAppend;
+    /**
+     * Validate the final key graph represented by a write before any workbook is
+     * mutated. Existing rows that are updated/deleted are removed first, which
+     * lets an update retain its own key and permits atomic key swaps.
+     */
+    private validateWriteConstraints;
+    private canonicalConstraintRow;
+    private candidateIdentityKey;
+    /** Read only constrained fields plus the minimum row-presence anchors. */
+    private scanConstraintRows;
     private recordTouched;
+    private pendingDeferredEntries;
+    /** Merge the durable queued state before predicates and joins are evaluated. */
+    private applyDeferredOverlay;
     private table;
+    /**
+     * Projected selections intentionally retain only the encoded columns that
+     * were read. Before a write needs the complete prior row, fetch just the
+     * missing column blocks for the already matched physical rows. This preserves
+     * selection reuse without repeating the original predicate scan.
+     */
+    private hydrateMaterializedRows;
+    /** Rebuild the complete decoded table row retained by encoded provenance. */
+    private physicalRowValue;
     private source;
     private sourceIdentity;
     private spreadsheetId;
+    private tableIdentity;
     private resolveTable;
+    private resolveIdentity;
+    private parseCachedSnapshot;
+    private parseCachedSnapshotValue;
+    private validCachedSheet;
+    private cachedSheetMetadata;
+    private knownSheetKey;
+    private knownSheetIdKey;
+    private rememberSheets;
     private parseHeader;
     private parseSnapshot;
     private requireSnapshot;
     private cacheForTable;
+    private queryCachePlansForTable;
+    private queryCacheKey;
+    private freshCacheEntries;
+    private staleCacheEntries;
+    private cachedSnapshotFrom;
+    private publishSnapshot;
+    private snapshotPayload;
+    /**
+     * Work out the smallest safe logical row shape shared by every query that
+     * depends on this table. Cold reads remain complete because physical column
+     * positions are schema data learned from the header row. Cache-backed reads
+     * also remain complete so a partial matrix is never published as a table
+     * snapshot.
+     */
+    private snapshotFieldsForQueries;
+    private snapshotReadPlan;
+    private partialSnapshotValues;
+    private readSnapshotGroup;
     private indexForQuery;
+    private locatorCacheEntry;
+    private hydratePersistentLocator;
+    private publishPersistentLocators;
+    private canPlanBounded;
     private tryBoundedRead;
     private scanLocator;
     private loadLocatedRows;
@@ -1301,9 +1759,11 @@ declare class GQueryExecutor implements SelectionRuntime {
     private registerLocators;
     private clearTableLocators;
     private tableCacheKey;
+    private staleTableCacheKey;
     private preflight;
     private assertSingleMutationTable;
     private groupPatchesBySpreadsheet;
+    private formatMutations;
     private sheetName;
     private invalidateMaterialized;
 }
@@ -1392,100 +1852,12 @@ declare class ScopedRetryTransportInvoker implements TransportInvoker {
     private readonly options;
     private activeBudget;
     private depth;
+    private completedRetries;
     constructor(controller: RetryController, options?: ScopedRetryTransportInvokerOptions);
     run<T>(operation: () => T): T;
     invoke<T>(context: TransportOperationContext, operation: () => T): T;
-}
-
-type SchemaIssueCode = "MISSING_SHEET" | "MISSING_HEADER" | "MISSING_VERSION_COLUMN" | "DUPLICATE_HEADER" | "INVALID_CELL" | "LEGACY_ENCODING" | "DUPLICATE_PRIMARY_KEY" | "BROKEN_RELATION";
-interface SchemaIssue {
-    readonly code: SchemaIssueCode;
-    readonly severity: "info" | "warning" | "error";
-    readonly source: string;
-    readonly spreadsheetId: string;
-    readonly table: string;
-    readonly sheet: string;
-    readonly row?: number;
-    readonly column?: string;
-    readonly header?: string;
-    readonly message: string;
-}
-type SchemaMigrationAction = {
-    readonly kind: "add-version-column";
-    readonly spreadsheetId: string;
-    readonly table: string;
-    readonly sheet: string;
-    readonly sheetId: number;
-    readonly header: string;
-    readonly columnIndex: number;
-    readonly dataRows: number;
-    readonly gridColumnCount: number;
-} | {
-    readonly kind: "create-system-sheet";
-    readonly spreadsheetId: string;
-    readonly sheet: "_gq_meta" | "_gq_dead_letters";
-} | {
-    readonly kind: "backfill-cell";
-    readonly spreadsheetId: string;
-    readonly table: string;
-    readonly sheet: string;
-    readonly sheetId: number;
-    readonly rowIndex: number;
-    readonly columnIndex: number;
-    readonly value: SheetCellInput;
-};
-interface SchemaPlan {
-    readonly schemaVersion: 2;
-    readonly generatedAt: string;
-    readonly issues: readonly SchemaIssue[];
-    readonly actions: readonly SchemaMigrationAction[];
-    readonly backupRequired: boolean;
-    readonly canMigrate: boolean;
-    readonly canonicalCells: number;
-    readonly legacyCells: number;
-    readonly invalidCells: number;
-}
-interface SchemaMigrationOptions {
-    readonly confirm: true;
-    readonly backupIds?: Readonly<Record<string, string>>;
-    readonly createBackups?: boolean;
-    readonly includeBackfill?: boolean;
-    readonly adapter?: SchemaMigrationAdapter;
-}
-interface SchemaMigrationResult {
-    readonly status: "migrated" | "no-op";
-    readonly backups: Readonly<Record<string, string>>;
-    readonly appliedActions: number;
-    readonly plan: SchemaPlan;
-}
-interface SchemaMigrationAdapter {
-    createBackup(spreadsheetId: string): string;
-    apply(spreadsheetId: string, actions: readonly SchemaMigrationAction[], context: {
-        readonly backupId: string;
-        readonly migratedAt: string;
-    }): void;
-}
-interface SchemaManagementAccess {
-    readonly definition: DatabaseDefinition;
-    readonly transport: SheetsTransport;
-    resolveSourceId(sourceName: string): string;
-}
-/** Read-only audit plus explicit, backup-gated schema migration. */
-declare class SchemaManager {
-    private readonly access;
-    constructor(access: SchemaManagementAccess);
-    plan(): SchemaPlan;
-    migrate(options: SchemaMigrationOptions): SchemaMigrationResult;
-    private loadTables;
-    private issue;
-}
-/** Default Apps Script migration adapter. It is used only by explicit migrate(). */
-declare class AppsScriptSchemaMigrationAdapter implements SchemaMigrationAdapter {
-    createBackup(spreadsheetId: string): string;
-    apply(spreadsheetId: string, actions: readonly SchemaMigrationAction[], context: {
-        readonly backupId: string;
-        readonly migratedAt: string;
-    }): void;
+    /** Monotonic counter consumed by executor result telemetry. */
+    retryCount(): number;
 }
 
 type ManagedTriggerKind = "edit" | "change" | "clock";
@@ -1497,11 +1869,15 @@ interface ManagedTriggerSpec {
 }
 interface InstalledTrigger extends ManagedTriggerSpec {
     readonly id: string;
+    /** True only when this reconciliation namespace durably owns the trigger ID. */
+    readonly managed?: boolean;
 }
 interface TriggerPlatform {
     list(): readonly InstalledTrigger[];
     create(spec: ManagedTriggerSpec): InstalledTrigger;
     remove(id: string): void;
+    /** Persist ownership when an exact pre-existing trigger is adopted. */
+    manage?(trigger: InstalledTrigger): InstalledTrigger;
 }
 interface TriggerConfiguration {
     readonly spreadsheetId: string;
@@ -1517,7 +1893,7 @@ interface TriggerReconciliationResult {
     readonly kept: readonly InstalledTrigger[];
     readonly removed: readonly InstalledTrigger[];
 }
-/** Reconciles only handlers named by the configuration and leaves unrelated project triggers alone. */
+/** Reconciles durably owned trigger IDs and leaves unrelated project triggers alone. */
 declare class TriggerReconciler {
     private readonly platform;
     constructor(platform: TriggerPlatform);
@@ -1530,6 +1906,7 @@ declare class AppsScriptTriggerPlatform implements TriggerPlatform {
     constructor(properties: PropertyStore, metadataNamespace?: string);
     list(): readonly InstalledTrigger[];
     create(spec: ManagedTriggerSpec): InstalledTrigger;
+    manage(trigger: InstalledTrigger): InstalledTrigger;
     remove(id: string): void;
     private metadataKey;
     private readMetadata;
@@ -1616,14 +1993,33 @@ declare class SystemManager {
 
 interface DeferredManagerAccess {
     readonly definition: DatabaseDefinition;
+    resolveSourceId(sourceName: string): string;
     find(tableName: string, key: Readonly<Record<string, unknown>>): Selection<Record<string, unknown>>;
     append(tableName: string, row: Record<string, unknown>): MutationResult<Record<string, unknown>>;
+    /**
+     * Optional optimized flush path. Implementations must return physical,
+     * cache-bypassing complete-table selections for every requested table in one
+     * batch read per workbook.
+     */
+    batchRead?(tableNames: readonly string[]): Readonly<Record<string, Selection<Record<string, unknown>>>>;
+    /** Commit intents derived from the immediately preceding physical batch read. */
+    commitBatch?(intents: readonly UnitOfWorkIntent[], snapshots: readonly WriteConstraintSnapshot[]): UnitOfWorkCommitResult;
+    /** Coordinate the physical read and write with other participating writers. */
+    withWriteLock?<T>(operation: () => T): T;
+    /** Suppress user-facing deferred guards while applying this journal itself. */
+    withoutDeferredGuard?<T>(operation: () => T): T;
 }
 interface DeferredManagerOptions {
     readonly journal?: DeferredJournal;
     readonly deadLetters?: DeferredDeadLetterSink;
     readonly appliedReceipts?: PropertyStore;
+    readonly retainedAppliedReceiptLimit?: number;
+    readonly appliedReceiptMaximumBytes?: number;
+    readonly appliedReceiptMaximumAgeMs?: number;
     readonly namespace?: string;
+}
+declare class AppsScriptDeadLetterSheet implements DeferredDeadLetterSink {
+    write(records: readonly DeferredDeadLetter[]): void;
 }
 /** Operational facade for the durable journal and five-minute flush handler. */
 declare class DeferredManager {
@@ -1639,6 +2035,36 @@ declare class DeferredManager {
     private defaultProperties;
 }
 
+type AnyRow$1 = Record<string, unknown>;
+type TableName<D extends DatabaseDefinition> = Extract<keyof D["tables"], string>;
+type TableAt$1<D extends DatabaseDefinition, N extends TableName<D>> = D["tables"][N];
+type RowAt$1<D extends DatabaseDefinition, N extends TableName<D>> = Extract<InferTableRow<TableAt$1<D, N>>, AnyRow$1>;
+type PrimaryKeyAt<D extends DatabaseDefinition, N extends TableName<D>> = TableAt$1<D, N> extends TableDefinition<infer _Columns, infer _Source, infer PrimaryKey, infer _Relations, infer _Unique> ? PrimaryKey : readonly string[];
+/** Key accepted by cache row invalidation: a scalar for one-column keys, an object for composites. */
+type CacheRowKey<D extends DatabaseDefinition, N extends TableName<D>> = PrimaryKeyAt<D, N> extends readonly [infer Field extends keyof RowAt$1<D, N>] ? RowAt$1<D, N>[Field] : PrimaryKeyAt<D, N> extends readonly [] ? never : Readonly<Pick<RowAt$1<D, N>, Extract<PrimaryKeyAt<D, N>[number], keyof RowAt$1<D, N>>>>;
+interface CacheInvalidationApi<D extends DatabaseDefinition> {
+    invalidateTable<N extends TableName<D>>(table: N): string;
+    invalidateRow<N extends TableName<D>>(table: N, key: CacheRowKey<D, N>): string;
+    invalidateTag(tag: string): string;
+}
+interface CacheInvalidationManagerOptions<D extends DatabaseDefinition> {
+    readonly definition: D;
+    readonly generations?: RuntimeGenerationAdapter;
+    readonly resolveSourceId: (sourceName: Extract<keyof D["sources"], string>) => string;
+}
+/** Public generation rotation surface. It never reads cache payloads or executes a table query. */
+declare class CacheInvalidationManager<D extends DatabaseDefinition> implements CacheInvalidationApi<D> {
+    private readonly options;
+    constructor(options: CacheInvalidationManagerOptions<D>);
+    invalidateTable<N extends TableName<D>>(table: N): string;
+    invalidateRow<N extends TableName<D>>(table: N, key: CacheRowKey<D, N>): string;
+    invalidateTag(tag: string): string;
+    private table;
+    private normalizeKey;
+    private requireGenerations;
+    private unsupported;
+}
+
 type AnyRow = Record<string, unknown>;
 type TableNames<D extends DatabaseDefinition> = Extract<keyof D["tables"], string>;
 type TableAt<D extends DatabaseDefinition, N extends TableNames<D>> = D["tables"][N];
@@ -1649,23 +2075,27 @@ type RelationValue<D extends DatabaseDefinition, R> = RelationTarget<R> extends 
 type IncludedRow<D extends DatabaseDefinition, N extends TableNames<D>, Row extends AnyRow, R extends Extract<keyof RelationsAt<D, N>, string>> = Row & {
     readonly [Name in R]: RelationValue<D, RelationsAt<D, N>[Name]>;
 };
-interface JoinOptions<Row extends AnyRow, OtherRow extends AnyRow, Alias extends string> {
+interface JoinOptions<Row extends AnyRow, OtherRow extends AnyRow, Alias extends string, Kind extends JoinKind = "left", Cardinality extends JoinCardinality = "one", Selected extends readonly Extract<keyof OtherRow, string>[] | undefined = undefined> {
     readonly as: Alias;
     readonly on: {
         readonly local: Extract<keyof Row, string> | readonly Extract<keyof Row, string>[];
         readonly foreign: Extract<keyof OtherRow, string> | readonly Extract<keyof OtherRow, string>[];
     };
-    readonly kind?: JoinKind;
-    readonly cardinality?: JoinCardinality;
-    readonly select?: readonly Extract<keyof OtherRow, string>[];
+    readonly kind?: Kind;
+    readonly cardinality?: Cardinality;
+    readonly select?: Selected;
 }
+type SelectedJoinRow<Target extends AnyRow, Selected extends readonly Extract<keyof Target, string>[] | undefined> = Selected extends readonly Extract<keyof Target, string>[] ? Pick<Target, Selected[number]> : Target;
+type AdHocJoinedRow<Base extends AnyRow, Target extends AnyRow, Alias extends string, Kind extends JoinKind, Cardinality extends JoinCardinality, Selected extends readonly Extract<keyof Target, string>[] | undefined> = Kind extends "semi" | "anti" ? Base : Base & {
+    readonly [Key in Alias]: Cardinality extends "many" ? readonly SelectedJoinRow<Target, Selected>[] : Kind extends "inner" ? SelectedJoinRow<Target, Selected> : SelectedJoinRow<Target, Selected> | null;
+};
 interface Group<T extends AnyRow> {
     readonly key: Readonly<Partial<T>>;
     readonly rows: readonly Readonly<T>[];
     readonly count: number;
 }
 interface UpsertResult<T extends AnyRow> {
-    readonly status: "committed" | "conflicted" | "partial";
+    readonly status: "committed" | "queued" | "conflicted" | "partial";
     readonly inserted: number;
     readonly updated: number;
     readonly unchanged: number;
@@ -1673,7 +2103,16 @@ interface UpsertResult<T extends AnyRow> {
     readonly workbooks: readonly WorkbookCommitReceipt[];
     readonly update?: MutationResult<T>;
     readonly insert?: MutationResult<T>;
+    /** Deferred upserts cannot know insert-versus-update until flush. */
+    readonly pending?: number;
+    readonly receipt?: PendingMutationReceipt$1;
     readonly stats: ExecutionStats;
+}
+interface UpsertOptions<T extends AnyRow> {
+    readonly keys?: readonly Extract<keyof T, string>[];
+    readonly delivery?: "immediate" | "deferred";
+    readonly idempotencyKey?: string;
+    readonly actor?: string;
 }
 interface SyncOptions<T extends AnyRow> {
     readonly keys?: readonly Extract<keyof T, string>[];
@@ -1692,54 +2131,61 @@ interface SyncResult<T extends AnyRow> extends UpsertResult<T> {
     readonly deactivated: number;
     readonly deleted: number;
 }
+type QueryMutationPatch<Visible extends AnyRow, Writable extends AnyRow> = Partial<Writable> | ((draft: Visible) => Partial<Writable> | void);
+/** Public selection view whose base-table mutation keys exclude joined aliases. */
+type QuerySelection<Visible extends AnyRow, Writable extends AnyRow> = Omit<Selection<Visible>, "refresh" | "update"> & {
+    refresh(): QuerySelection<Visible, Writable>;
+    update(patch: QueryMutationPatch<Visible, Writable>, options?: MutationOptions): MutationResult<Visible>;
+};
 /** An immutable query handle. Every chain method returns a new instance. */
-declare class Query<D extends DatabaseDefinition, N extends TableNames<D>, Row extends AnyRow = RowAt<D, N>> {
+declare class Query<D extends DatabaseDefinition, N extends TableNames<D>, Row extends AnyRow = RowAt<D, N>, WritableRow extends AnyRow = RowAt<D, N>> {
     protected readonly database: GQueryDatabase<D>;
     readonly tableName: N;
     protected readonly plan: SerializableQueryPlan;
     protected readonly localPredicates: readonly ((row: Readonly<Row>) => boolean)[];
     constructor(database: GQueryDatabase<D>, tableName: N, plan: SerializableQueryPlan, localPredicates?: readonly ((row: Readonly<Row>) => boolean)[]);
-    protected next<NextRow extends AnyRow = Row>(plan: SerializableQueryPlan, localPredicates?: readonly ((row: Readonly<NextRow>) => boolean)[]): Query<D, N, NextRow>;
-    all(): Query<D, N, Row>;
-    where(predicate: Where<Row>): Query<D, N, Row>;
-    whereLocal(predicate: (row: Readonly<Row>) => boolean): Query<D, N, Row>;
-    select<const Fields extends readonly Extract<keyof Row, string>[]>(fields: Fields): Query<D, N, Pick<Row, Fields[number]> & AnyRow>;
-    orderBy(field: Extract<keyof Row, string>, direction?: SortDirection): Query<D, N, Row>;
-    limit(value: number): Query<D, N, Row>;
-    offset(value: number): Query<D, N, Row>;
-    tail(value: number): Query<D, N, Row>;
-    include<RelationName extends Extract<keyof RelationsAt<D, N>, string>>(name: RelationName): Query<D, N, IncludedRow<D, N, Row, RelationName>>;
-    join<OtherName extends TableNames<D>, const Alias extends string>(other: TableHandle<D, OtherName>, options: JoinOptions<Row, RowAt<D, OtherName>, Alias>): Query<D, N, Row & {
-        readonly [Key in Alias]: RowAt<D, OtherName> | readonly RowAt<D, OtherName>[] | null;
-    }>;
-    get(): Selection<Row>;
-    findOne(): Selection<Row>;
-    maybeOne(): Selection<Row>;
-    find(key: unknown): Selection<Row>;
+    protected next<NextRow extends AnyRow = Row>(plan: SerializableQueryPlan, localPredicates?: readonly ((row: Readonly<NextRow>) => boolean)[]): Query<D, N, NextRow, WritableRow>;
+    all(): Query<D, N, Row, WritableRow>;
+    where(predicate: Where<Row>): Query<D, N, Row, WritableRow>;
+    whereLocal(predicate: (row: Readonly<Row>) => boolean): Query<D, N, Row, WritableRow>;
+    select<const Fields extends readonly Extract<keyof Row, string>[]>(fields: Fields): Query<D, N, Pick<Row, Fields[number]> & AnyRow, WritableRow>;
+    orderBy(field: Extract<keyof Row, string>, direction?: SortDirection): Query<D, N, Row, WritableRow>;
+    limit(value: number): Query<D, N, Row, WritableRow>;
+    offset(value: number): Query<D, N, Row, WritableRow>;
+    tail(value: number): Query<D, N, Row, WritableRow>;
+    include<RelationName extends Extract<keyof RelationsAt<D, N>, string>>(name: RelationName): Query<D, N, IncludedRow<D, N, Row, RelationName>, WritableRow>;
+    join<OtherName extends TableNames<D>, const Alias extends string, const Kind extends JoinKind = "left", const Cardinality extends JoinCardinality = "one", const Selected extends readonly Extract<keyof RowAt<D, OtherName>, string>[] | undefined = undefined>(other: TableHandle<D, OtherName>, options: JoinOptions<Row, RowAt<D, OtherName>, Alias, Kind, Cardinality, Selected>): Query<D, N, AdHocJoinedRow<Row, RowAt<D, OtherName>, Alias, Kind, Cardinality, Selected>, WritableRow>;
+    get(): QuerySelection<Row, WritableRow>;
+    findOne(): QuerySelection<Row, WritableRow>;
+    maybeOne(): QuerySelection<Row, WritableRow>;
+    find(key: unknown): QuerySelection<Row, WritableRow>;
     count(): number;
     exists(): boolean;
+    /** Execute aggregates with a key-only output shape; joined rows are still
+     * validated for cardinality, but their payload columns are not materialized. */
+    private aggregateSelection;
     groupBy(fields: readonly Extract<keyof Row, string>[]): readonly Group<Row>[];
-    update(patch: MutationPatch<Row>, options?: MutationOptions): MutationResult<Row>;
+    update(patch: QueryMutationPatch<Row, WritableRow>, options?: MutationOptions): MutationResult<Row>;
     delete(options?: DeleteOptions): MutationResult<Row>;
     explain(): ExecutionPlan;
     executable(): ExecutableQuery<Row>;
 }
 declare class TableHandle<D extends DatabaseDefinition, N extends TableNames<D>> extends Query<D, N, RowAt<D, N>> {
     constructor(database: GQueryDatabase<D>, tableName: N);
-    append(row: RowAt<D, N>): MutationResult<RowAt<D, N>>;
-    appendMany(rows: readonly RowAt<D, N>[]): MutationResult<RowAt<D, N>>;
-    upsertMany(incoming: readonly RowAt<D, N>[], options?: {
-        readonly keys?: readonly Extract<keyof RowAt<D, N>, string>[];
-    }): UpsertResult<RowAt<D, N>>;
+    append(row: RowAt<D, N>, options?: MutationOptions): MutationResult<RowAt<D, N>>;
+    appendMany(rows: readonly RowAt<D, N>[], options?: MutationOptions): MutationResult<RowAt<D, N>>;
+    upsertMany(incoming: readonly RowAt<D, N>[], options?: UpsertOptions<RowAt<D, N>>): UpsertResult<RowAt<D, N>>;
+    private upsertManyUnlocked;
     sync(incoming: readonly RowAt<D, N>[], options?: SyncOptions<RowAt<D, N>>): SyncResult<RowAt<D, N>>;
+    private syncUnlocked;
 }
 type TableHandles<D extends DatabaseDefinition> = {
     readonly [N in TableNames<D>]: TableHandle<D, N>;
 };
-type BatchSelections<Q extends Readonly<Record<string, Query<any, any, any>>>> = {
-    readonly [K in keyof Q]: Q[K] extends Query<any, any, infer Row> ? Selection<Extract<Row, AnyRow>> : never;
+type BatchSelections<Q extends Readonly<Record<string, Query<any, any, any, any>>>> = {
+    readonly [K in keyof Q]: Q[K] extends Query<any, any, infer Row, infer WritableRow> ? QuerySelection<Extract<Row, AnyRow>, Extract<WritableRow, AnyRow>> : never;
 };
-declare class BatchQuery<D extends DatabaseDefinition, Q extends Readonly<Record<string, Query<any, any, any>>>> {
+declare class BatchQuery<D extends DatabaseDefinition, Q extends Readonly<Record<string, Query<any, any, any, any>>>> {
     private readonly database;
     private readonly queries;
     constructor(database: GQueryDatabase<D>, queries: Q);
@@ -1753,6 +2199,7 @@ interface RawValuesApi<Sources extends SourceMap> {
 }
 interface CreateGQueryOptions extends Omit<ExecutorOptions, "transport"> {
     readonly transport?: SheetsTransport;
+    readonly canonicalState?: SchemaCanonicalState;
     readonly retry?: ScopedRetryTransportInvokerOptions;
     readonly systemHooks?: ManualEditHooks;
     readonly deferredDeadLetters?: DeferredDeadLetterSink;
@@ -1777,6 +2224,8 @@ interface DatabaseInternals {
     readonly deferredJournal?: DeferredJournal;
     readonly deferredDeadLetters?: DeferredDeadLetterSink;
     readonly deferredAppliedReceipts?: PropertyStore;
+    readonly canonicalState?: SchemaCanonicalState;
+    readonly deferredOverlay?: DeferredOverlayReader;
 }
 declare class GQueryDatabase<D extends DatabaseDefinition> {
     readonly definition: D;
@@ -1788,6 +2237,7 @@ declare class GQueryDatabase<D extends DatabaseDefinition> {
     readonly schema: SchemaManager;
     readonly system: SystemManager;
     readonly deferred: DeferredManager;
+    readonly cache: CacheInvalidationApi<D>;
     private readonly selectionRuntime;
     private readonly appendOperation;
     private readonly transport;
@@ -1797,10 +2247,25 @@ declare class GQueryDatabase<D extends DatabaseDefinition> {
     private readonly deferredJournal?;
     private readonly deferredDeadLetters?;
     private readonly deferredAppliedReceipts?;
+    private readonly canonicalState;
+    private readonly deferredOverlay?;
     constructor(definition: D, options?: CreateGQueryOptions, internals?: DatabaseInternals);
-    batch<const Q extends Readonly<Record<string, Query<any, any, any>>>>(queries: Q): BatchQuery<D, Q>;
+    batch<const Q extends Readonly<Record<string, Query<any, any, any, any>>>>(queries: Q): BatchQuery<D, Q>;
+    /** Internal lifecycle gate shared by transaction-backed handles. */
+    assertTransactionOpen(operation: string): void;
+    decorateExecutable<T extends AnyRow>(query: ExecutableQuery<T>): ExecutableQuery<T>;
     materialize<T extends AnyRow>(selection: Selection<T>): Selection<T>;
     appendRows<T extends AnyRow>(tableName: string, rows: readonly T[]): MutationResult<T>;
+    deferKeyedWrite<T extends AnyRow>(tableName: string, row: T, kind: "create" | "upsert", options: Pick<MutationOptions, "idempotencyKey" | "actor">): MutationResult<T>;
+    commitIntents(intents: readonly UnitOfWorkIntent[], constraintSnapshots?: readonly WriteConstraintSnapshot[]): Omit<UnitOfWorkCommitResult, "status"> & {
+        readonly status: UnitOfWorkCommitResult["status"] | "queued";
+    };
+    /**
+     * Serialize read-modify-write helpers with the same participating-writer lock
+     * used by units of work. Transaction-backed handles already run under their
+     * outer lock and therefore execute directly.
+     */
+    withParticipatingWriteLock<T>(operation: () => T, timeoutMs?: number): T;
     unitOfWork<T>(options: UnitOfWorkOptions, callback: (transaction: GQuery<D>) => T): UnitOfWorkResult<T>;
     unitOfWork<T>(callback: (transaction: GQuery<D>) => T): UnitOfWorkResult<T>;
     resolveSourceId(sourceName: Extract<keyof D["sources"], string>, resolver?: () => string): string;
@@ -1816,6 +2281,11 @@ type index_d_ApiFailure = ApiFailure;
 declare const index_d_ApiFailure: typeof ApiFailure;
 type index_d_ApiFailureDetails = ApiFailureDetails;
 type index_d_ApiFailureKind = ApiFailureKind;
+type index_d_AppliedMutationReceiptLedger = AppliedMutationReceiptLedger;
+declare const index_d_AppliedMutationReceiptLedger: typeof AppliedMutationReceiptLedger;
+type index_d_AppliedMutationReceiptLedgerOptions = AppliedMutationReceiptLedgerOptions;
+type index_d_AppliedReceiptCapacityError = AppliedReceiptCapacityError;
+declare const index_d_AppliedReceiptCapacityError: typeof AppliedReceiptCapacityError;
 type index_d_AppsScriptCacheScope = AppsScriptCacheScope;
 type index_d_AppsScriptCacheStore = AppsScriptCacheStore;
 declare const index_d_AppsScriptCacheStore: typeof AppsScriptCacheStore;
@@ -1843,6 +2313,8 @@ type index_d_ChunkedDeferredOverlay = ChunkedDeferredOverlay;
 declare const index_d_ChunkedDeferredOverlay: typeof ChunkedDeferredOverlay;
 type index_d_Clock = Clock;
 type index_d_CoalescedDeferredMutation = CoalescedDeferredMutation;
+declare const index_d_DEFERRED_DEAD_LETTER_ACTOR_HEADER: typeof DEFERRED_DEAD_LETTER_ACTOR_HEADER;
+declare const index_d_DEFERRED_DEAD_LETTER_BASE_HEADERS: typeof DEFERRED_DEAD_LETTER_BASE_HEADERS;
 type index_d_DeadlineExceededError = DeadlineExceededError;
 declare const index_d_DeadlineExceededError: typeof DeadlineExceededError;
 type index_d_DeferredDeadLetter = DeferredDeadLetter;
@@ -1861,6 +2333,7 @@ type index_d_DeferredMutationTooLargeError = DeferredMutationTooLargeError;
 declare const index_d_DeferredMutationTooLargeError: typeof DeferredMutationTooLargeError;
 type index_d_DeferredOutcomeStatus = DeferredOutcomeStatus;
 type index_d_DeferredOverlayPublisher = DeferredOverlayPublisher;
+type index_d_DeferredOverlayReader = DeferredOverlayReader;
 type index_d_DeferredReceiptStatus = DeferredReceiptStatus;
 type index_d_DependencyGeneration = DependencyGeneration;
 type index_d_ExecutionBudget = ExecutionBudget;
@@ -1881,6 +2354,8 @@ type index_d_JournalCapacityError = JournalCapacityError;
 declare const index_d_JournalCapacityError: typeof JournalCapacityError;
 type index_d_JournalCorruptionError = JournalCorruptionError;
 declare const index_d_JournalCorruptionError: typeof JournalCorruptionError;
+type index_d_JournalFlushLeaseLostError = JournalFlushLeaseLostError;
+declare const index_d_JournalFlushLeaseLostError: typeof JournalFlushLeaseLostError;
 type index_d_JournalLockTimeoutError = JournalLockTimeoutError;
 declare const index_d_JournalLockTimeoutError: typeof JournalLockTimeoutError;
 type index_d_ManagedTriggerKind = ManagedTriggerKind;
@@ -1898,6 +2373,8 @@ type index_d_RandomSource = RandomSource;
 type index_d_ReadThroughResult<T> = ReadThroughResult<T>;
 type index_d_ReadThroughState = ReadThroughState;
 type index_d_RegisteredSheetTable = RegisteredSheetTable;
+type index_d_RequestPayloadTooLargeError = RequestPayloadTooLargeError;
+declare const index_d_RequestPayloadTooLargeError: typeof RequestPayloadTooLargeError;
 type index_d_RetryAttemptContext = RetryAttemptContext;
 type index_d_RetryController = RetryController;
 declare const index_d_RetryController: typeof RetryController;
@@ -1940,9 +2417,9 @@ declare const index_d_normalizeApiFailure: typeof normalizeApiFailure;
 declare const index_d_systemClock: typeof systemClock;
 declare const index_d_withLock: typeof withLock;
 declare namespace index_d {
-  export { index_d_AmbiguousCommitError as AmbiguousCommitError, index_d_ApiFailure as ApiFailure, index_d_AppsScriptCacheStore as AppsScriptCacheStore, index_d_AppsScriptGzipBase64Codec as AppsScriptGzipBase64Codec, index_d_AppsScriptLock as AppsScriptLock, index_d_AppsScriptPropertyStore as AppsScriptPropertyStore, index_d_AppsScriptSha256Hash as AppsScriptSha256Hash, index_d_AppsScriptTriggerPlatform as AppsScriptTriggerPlatform, index_d_ChunkedCache as ChunkedCache, index_d_ChunkedDeferredOverlay as ChunkedDeferredOverlay, index_d_DeadlineExceededError as DeadlineExceededError, index_d_DeferredJournal as DeferredJournal, index_d_DeferredMutationTooLargeError as DeferredMutationTooLargeError, index_d_ExecutionBudget as ExecutionBudget, index_d_Fnv1aHash as Fnv1aHash, index_d_GQueryV2Error as GQueryV2Error, index_d_GenerationTokenStore as GenerationTokenStore, index_d_IdempotencyConflictError as IdempotencyConflictError, index_d_JournalCapacityError as JournalCapacityError, index_d_JournalCorruptionError as JournalCorruptionError, index_d_JournalLockTimeoutError as JournalLockTimeoutError, index_d_PlainTextCacheCodec as PlainTextCacheCodec, index_d_RetryController as RetryController, index_d_RetryExhaustedError as RetryExhaustedError, index_d_RetryTransportInvoker as RetryTransportInvoker, index_d_ScopedRetryTransportInvoker as ScopedRetryTransportInvoker, index_d_SystemEventCoordinator as SystemEventCoordinator, index_d_TriggerReconciler as TriggerReconciler, index_d_appsScriptSleeper as appsScriptSleeper, index_d_buildQueryCacheKey as buildQueryCacheKey, index_d_canonicalStringify as canonicalStringify, index_d_coalesceDeferredMutations as coalesceDeferredMutations, index_d_createAppsScriptChunkedCache as createAppsScriptChunkedCache, index_d_createAppsScriptDeferredJournal as createAppsScriptDeferredJournal, index_d_createAppsScriptGenerationStore as createAppsScriptGenerationStore, index_d_createAppsScriptTriggerReconciler as createAppsScriptTriggerReconciler, index_d_hashCanonical as hashCanonical, index_d_mathRandomSource as mathRandomSource, index_d_normalizeApiFailure as normalizeApiFailure, index_d_systemClock as systemClock, index_d_withLock as withLock };
-  export type { index_d_ApiFailureDetails as ApiFailureDetails, index_d_ApiFailureKind as ApiFailureKind, index_d_AppsScriptCacheScope as AppsScriptCacheScope, index_d_AppsScriptChunkedCacheOptions as AppsScriptChunkedCacheOptions, index_d_CacheDependency as CacheDependency, index_d_CacheReadResult as CacheReadResult, index_d_CacheReadState as CacheReadState, index_d_CacheStore as CacheStore, index_d_CacheTextCodec as CacheTextCodec, index_d_ChunkedCacheDependencies as ChunkedCacheDependencies, index_d_ChunkedCachePolicy as ChunkedCachePolicy, index_d_Clock as Clock, index_d_CoalescedDeferredMutation as CoalescedDeferredMutation, index_d_DeferredDeadLetter as DeferredDeadLetter, index_d_DeferredDeadLetterSink as DeferredDeadLetterSink, index_d_DeferredEnqueueResult as DeferredEnqueueResult, index_d_DeferredFlushResult as DeferredFlushResult, index_d_DeferredJournalDependencies as DeferredJournalDependencies, index_d_DeferredJournalOptions as DeferredJournalOptions, index_d_DeferredMutationBatchExecutor as DeferredMutationBatchExecutor, index_d_DeferredMutationInput as DeferredMutationInput, index_d_DeferredMutationKind as DeferredMutationKind, index_d_DeferredMutationOutcome as DeferredMutationOutcome, index_d_DeferredOutcomeStatus as DeferredOutcomeStatus, index_d_DeferredOverlayPublisher as DeferredOverlayPublisher, index_d_DeferredReceiptStatus as DeferredReceiptStatus, index_d_DependencyGeneration as DependencyGeneration, index_d_GQueryErrorCode as GQueryErrorCode, index_d_HashFunction as HashFunction, index_d_IdGenerator as IdGenerator, index_d_InstalledTrigger as InstalledTrigger, index_d_ManagedTriggerKind as ManagedTriggerKind, index_d_ManagedTriggerSpec as ManagedTriggerSpec, index_d_ManualEditHooks as ManualEditHooks, index_d_NormalizedChangeEvent as NormalizedChangeEvent, index_d_NormalizedEditEvent as NormalizedEditEvent, index_d_PendingDeferredMutation as PendingDeferredMutation, index_d_PendingMutationReceipt as PendingMutationReceipt, index_d_PropertyStore as PropertyStore, index_d_QueryCacheKeyInput as QueryCacheKeyInput, index_d_RandomSource as RandomSource, index_d_ReadThroughResult as ReadThroughResult, index_d_ReadThroughState as ReadThroughState, index_d_RegisteredSheetTable as RegisteredSheetTable, index_d_RetryAttemptContext as RetryAttemptContext, index_d_RetryControllerDependencies as RetryControllerDependencies, index_d_RetryExecution as RetryExecution, index_d_RetryExecutionOptions as RetryExecutionOptions, index_d_RetryOperation as RetryOperation, index_d_RetryOperationKind as RetryOperationKind, index_d_RetryPolicy as RetryPolicy, index_d_RetryStats as RetryStats, index_d_RetryTransportInvokerOptions as RetryTransportInvokerOptions, index_d_ScopedRetryTransportInvokerOptions as ScopedRetryTransportInvokerOptions, index_d_Sleeper as Sleeper, index_d_SyncLock as SyncLock, index_d_SystemEventResult as SystemEventResult, index_d_TriggerConfiguration as TriggerConfiguration, index_d_TriggerPlatform as TriggerPlatform, index_d_TriggerReconciliationResult as TriggerReconciliationResult };
+  export { index_d_AmbiguousCommitError as AmbiguousCommitError, index_d_ApiFailure as ApiFailure, index_d_AppliedMutationReceiptLedger as AppliedMutationReceiptLedger, index_d_AppliedReceiptCapacityError as AppliedReceiptCapacityError, index_d_AppsScriptCacheStore as AppsScriptCacheStore, index_d_AppsScriptGzipBase64Codec as AppsScriptGzipBase64Codec, index_d_AppsScriptLock as AppsScriptLock, index_d_AppsScriptPropertyStore as AppsScriptPropertyStore, index_d_AppsScriptSha256Hash as AppsScriptSha256Hash, index_d_AppsScriptTriggerPlatform as AppsScriptTriggerPlatform, index_d_ChunkedCache as ChunkedCache, index_d_ChunkedDeferredOverlay as ChunkedDeferredOverlay, index_d_DEFERRED_DEAD_LETTER_ACTOR_HEADER as DEFERRED_DEAD_LETTER_ACTOR_HEADER, index_d_DEFERRED_DEAD_LETTER_BASE_HEADERS as DEFERRED_DEAD_LETTER_BASE_HEADERS, index_d_DeadlineExceededError as DeadlineExceededError, index_d_DeferredJournal as DeferredJournal, index_d_DeferredMutationTooLargeError as DeferredMutationTooLargeError, index_d_ExecutionBudget as ExecutionBudget, index_d_Fnv1aHash as Fnv1aHash, index_d_GQueryV2Error as GQueryV2Error, index_d_GenerationTokenStore as GenerationTokenStore, index_d_IdempotencyConflictError as IdempotencyConflictError, index_d_JournalCapacityError as JournalCapacityError, index_d_JournalCorruptionError as JournalCorruptionError, index_d_JournalFlushLeaseLostError as JournalFlushLeaseLostError, index_d_JournalLockTimeoutError as JournalLockTimeoutError, index_d_PlainTextCacheCodec as PlainTextCacheCodec, index_d_RequestPayloadTooLargeError as RequestPayloadTooLargeError, index_d_RetryController as RetryController, index_d_RetryExhaustedError as RetryExhaustedError, index_d_RetryTransportInvoker as RetryTransportInvoker, index_d_ScopedRetryTransportInvoker as ScopedRetryTransportInvoker, index_d_SystemEventCoordinator as SystemEventCoordinator, index_d_TriggerReconciler as TriggerReconciler, index_d_appsScriptSleeper as appsScriptSleeper, index_d_buildQueryCacheKey as buildQueryCacheKey, index_d_canonicalStringify as canonicalStringify, index_d_coalesceDeferredMutations as coalesceDeferredMutations, index_d_createAppsScriptChunkedCache as createAppsScriptChunkedCache, index_d_createAppsScriptDeferredJournal as createAppsScriptDeferredJournal, index_d_createAppsScriptGenerationStore as createAppsScriptGenerationStore, index_d_createAppsScriptTriggerReconciler as createAppsScriptTriggerReconciler, index_d_hashCanonical as hashCanonical, index_d_mathRandomSource as mathRandomSource, index_d_normalizeApiFailure as normalizeApiFailure, index_d_systemClock as systemClock, index_d_withLock as withLock };
+  export type { index_d_ApiFailureDetails as ApiFailureDetails, index_d_ApiFailureKind as ApiFailureKind, index_d_AppliedMutationReceiptLedgerOptions as AppliedMutationReceiptLedgerOptions, index_d_AppsScriptCacheScope as AppsScriptCacheScope, index_d_AppsScriptChunkedCacheOptions as AppsScriptChunkedCacheOptions, index_d_CacheDependency as CacheDependency, index_d_CacheReadResult as CacheReadResult, index_d_CacheReadState as CacheReadState, index_d_CacheStore as CacheStore, index_d_CacheTextCodec as CacheTextCodec, index_d_ChunkedCacheDependencies as ChunkedCacheDependencies, index_d_ChunkedCachePolicy as ChunkedCachePolicy, index_d_Clock as Clock, index_d_CoalescedDeferredMutation as CoalescedDeferredMutation, index_d_DeferredDeadLetter as DeferredDeadLetter, index_d_DeferredDeadLetterSink as DeferredDeadLetterSink, index_d_DeferredEnqueueResult as DeferredEnqueueResult, index_d_DeferredFlushResult as DeferredFlushResult, index_d_DeferredJournalDependencies as DeferredJournalDependencies, index_d_DeferredJournalOptions as DeferredJournalOptions, index_d_DeferredMutationBatchExecutor as DeferredMutationBatchExecutor, index_d_DeferredMutationInput as DeferredMutationInput, index_d_DeferredMutationKind as DeferredMutationKind, index_d_DeferredMutationOutcome as DeferredMutationOutcome, index_d_DeferredOutcomeStatus as DeferredOutcomeStatus, index_d_DeferredOverlayPublisher as DeferredOverlayPublisher, index_d_DeferredOverlayReader as DeferredOverlayReader, index_d_DeferredReceiptStatus as DeferredReceiptStatus, index_d_DependencyGeneration as DependencyGeneration, index_d_GQueryErrorCode as GQueryErrorCode, index_d_HashFunction as HashFunction, index_d_IdGenerator as IdGenerator, index_d_InstalledTrigger as InstalledTrigger, index_d_ManagedTriggerKind as ManagedTriggerKind, index_d_ManagedTriggerSpec as ManagedTriggerSpec, index_d_ManualEditHooks as ManualEditHooks, index_d_NormalizedChangeEvent as NormalizedChangeEvent, index_d_NormalizedEditEvent as NormalizedEditEvent, index_d_PendingDeferredMutation as PendingDeferredMutation, index_d_PendingMutationReceipt as PendingMutationReceipt, index_d_PropertyStore as PropertyStore, index_d_QueryCacheKeyInput as QueryCacheKeyInput, index_d_RandomSource as RandomSource, index_d_ReadThroughResult as ReadThroughResult, index_d_ReadThroughState as ReadThroughState, index_d_RegisteredSheetTable as RegisteredSheetTable, index_d_RetryAttemptContext as RetryAttemptContext, index_d_RetryControllerDependencies as RetryControllerDependencies, index_d_RetryExecution as RetryExecution, index_d_RetryExecutionOptions as RetryExecutionOptions, index_d_RetryOperation as RetryOperation, index_d_RetryOperationKind as RetryOperationKind, index_d_RetryPolicy as RetryPolicy, index_d_RetryStats as RetryStats, index_d_RetryTransportInvokerOptions as RetryTransportInvokerOptions, index_d_ScopedRetryTransportInvokerOptions as ScopedRetryTransportInvokerOptions, index_d_Sleeper as Sleeper, index_d_SyncLock as SyncLock, index_d_SystemEventResult as SystemEventResult, index_d_TriggerConfiguration as TriggerConfiguration, index_d_TriggerPlatform as TriggerPlatform, index_d_TriggerReconciliationResult as TriggerReconciliationResult };
 }
 
-export { AppsScriptManualEditHooks, AppsScriptSchemaMigrationAdapter, AppsScriptSheetsTransport, BLANK_CELL, BatchQuery, DeferredManager, GQueryCodecError, GQueryDatabase, GQueryDefinitionError, GQueryError, GQueryExecutor, GQueryRuntimeError, InMemorySheetsTransport, LEGACY_NO_MATCH, Query, SELECTION_INTERNAL, SchemaManager, Selection, SystemManager, TableHandle, assertSheetCellInput, assertSheetCellValue, atomicMutationToSheetsRequest, belongsTo, booleanColumn as boolean, booleanColumn, canonicalStringify$1 as canonicalStringify, cellRange, cloneProvenance, cloneQueryPlan, cloneRawMatrix, cloneSheetInputMatrix, columnIndexToLetter, columnLetterToIndex, combinePredicates, compactCellUpdates, compactRowDeletes, createExecutionStats, createGQuery, date, datetime, decimal, defineDatabase, emptyQueryPlan, encodeAtomicExtendedValue, encodeAtomicRows, encodeRawCell, encodeRawExtendedValue, encodeRawRows, enumeration, evaluatePredicate, formula, hasMany, hasOne, hashCanonical$1 as hashCanonical, identifier, index_d as infrastructure, integer, isColumnDefinition, isDatabaseDefinition, isFormulaCell, isTableDefinition, json, mergeExecutionStats, normalizeReturnedMatrix, normalizeWhere, nullable, number, optional, parseA1Range, quoteSheetName, selectionProvenance, sheetNameFromRange, sheetRange, source, structured, table, text, withBlankPolicy, withDefault };
-export type { ActiveSpreadsheetSourceDefinition, AppsScriptSheetsTransportOptions, AtomicBatchUpdateOptions, AtomicBatchUpdateResult, AtomicCellUpdate, AtomicMutation, AtomicRowAppend, AtomicRowDelete, BaseColumnOptions, BlankCell, BlankPolicy, BlankPolicyOutput, BooleanColumnOptions, CacheMode, CacheScope, CellFormat, CellPatch, CodecContext, CodecDirection, ColumnCodec, ColumnDefinition, ColumnKey, ColumnMap, CreateGQueryOptions, DatabaseConfig, DatabaseDefinition, DateColumnOptions, DecimalColumnOptions, DeferredManagerAccess, DeferredManagerOptions, DeleteBehavior, DeleteOptions, EncodedCell, EnumCellValue, EnumerationColumnOptions, ExecutableQuery, ExecutionMode, ExecutionPlan, ExecutionPlanStep, ExecutionPlanStepKind, ExecutionPlanWarning, ExecutionStats, ExecutorOptions, FieldOperators, FormulaCell, FormulaColumnOptions, GQuery, GQueryErrorCode$1 as GQueryErrorCode, GQueryErrorOptions, Group, InMemorySheetSeed, InMemorySpreadsheetSeed, InMemoryTransportCall, IncludedRow, InferColumn, InferDatabaseRows, InferRow, InferTableRow, IntegerColumnOptions, JoinCardinality, JoinKind, JoinOptions, JoinPlan, JsonColumnOptions, JsonPrimitive, JsonValue, LegacyDecoder, LegacyNoMatch, MaterializedRow, MutationConflict, MutationOptions, MutationPatch, MutationResult, MutationStatus, NonEmptyKey, NumberColumnOptions, OrderClause, ParsedA1Range, PendingMutationReceipt$1 as PendingMutationReceipt, PredicateNode, PredicateOperator, QueryExecution, RawCellData, RawExtendedValue, RawValuesApi, RelationCardinality, RelationDefinition, RelationKey, RelationKind, RelationMap, RelationOptions, RowAt, RowPatch, RowProvenance, RuntimeCacheAdapter, RuntimeErrorCode, RuntimeErrorOptions, RuntimeGenerationAdapter, SchemaIssue, SchemaIssueCode, SchemaManagementAccess, SchemaMigrationAction, SchemaMigrationAdapter, SchemaMigrationOptions, SchemaMigrationResult, SchemaPlan, SelectionInternal, SelectionRuntime, SerializableQueryPlan, SheetBatchGetResult, SheetBatchUpdateOptions, SheetBatchUpdateResult, SheetCellInput, SheetCellValue, SheetDateTimeRenderOption, SheetMajorDimension, SheetMetadata, SheetReadOptions, SheetUpdateResult, SheetValueInputOption, SheetValueRange, SheetValueRenderOption, SheetValueUpdate, SheetsTransport, SortDirection, SourceDefinition, SourceMap, SpreadsheetIdSourceDefinition, SpreadsheetMetadata, StructuredColumnOptions, SyncOptions, SyncResult, SystemManagerAccess, SystemStatus, TableCacheDefinition, TableConfig, TableDefinition, TableHandles, TableMap, TextColumnOptions, TransportInvoker, TransportOperationContext, TransportOperationKind, TriggerSetup, UnitOfWorkCommitResult, UnitOfWorkIntent, UnitOfWorkOptions, UnitOfWorkResult, UpsertResult, Where, WorkbookCommitReceipt };
+export { ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT, AppsScriptDeadLetterSheet, AppsScriptManualEditHooks, AppsScriptSchemaCanonicalModeAdapter, AppsScriptSchemaCanonicalState, AppsScriptSchemaMigrationAdapter, AppsScriptSheetsTransport, BLANK_CELL, BatchQuery, CacheInvalidationManager, DeferredManager, GQueryCodecError, GQueryDatabase, GQueryDefinitionError, GQueryError, GQueryExecutor, GQueryRuntimeError, InMemorySchemaCanonicalState, InMemorySheetsTransport, LEGACY_NO_MATCH, Query, SELECTION_INTERNAL, SchemaManager, Selection, SystemManager, TableHandle, assertAtomicBatchPayloadSize, assertSheetCellInput, assertSheetCellValue, atomicMutationToSheetsRequest, belongsTo, booleanColumn as boolean, booleanColumn, canonicalStringify$1 as canonicalStringify, cellRange, cloneProvenance, cloneQueryPlan, cloneRawMatrix, cloneSheetInputMatrix, columnIndexToLetter, columnLetterToIndex, combinePredicates, compactCellUpdates, compactRowDeletes, createExecutionStats, createGQuery, date, datetime, decimal, defineDatabase, emptyQueryPlan, encodeAtomicExtendedValue, encodeAtomicRows, encodeRawCell, encodeRawExtendedValue, encodeRawRows, enumeration, evaluatePredicate, formula, hasMany, hasOne, hashCanonical$1 as hashCanonical, identifier, index_d as infrastructure, integer, invalidateChangedRelations, isColumnDefinition, isDatabaseDefinition, isFormulaCell, isTableDefinition, json, mergeExecutionStats, normalizeReturnedMatrix, normalizeWhere, nullable, number, optional, parseA1Range, quoteSheetName, selectionProvenance, sheetNameFromRange, sheetRange, source, strictCanonicalPropertyKey, structured, table, text, utf8ByteLength, withBlankPolicy, withDefault };
+export type { ActiveSpreadsheetSourceDefinition, AppsScriptSchemaCanonicalStateOptions, AppsScriptSheetsTransportOptions, AtomicBatchUpdateOptions, AtomicBatchUpdateResult, AtomicCellFormat, AtomicCellUpdate, AtomicMutation, AtomicRowAppend, AtomicRowDelete, BaseColumnOptions, BlankCell, BlankPolicy, BlankPolicyOutput, BooleanColumnOptions, CacheInvalidationApi, CacheMode, CacheRowKey, CacheScope, CellFormat, CellPatch, CodecContext, CodecDirection, ColumnCodec, ColumnDefinition, ColumnKey, ColumnMap, CreateGQueryOptions, DatabaseConfig, DatabaseDefinition, DateColumnOptions, DecimalColumnOptions, DeferredManagerAccess, DeferredManagerOptions, DeleteBehavior, DeleteOptions, EncodedCell, EnumCellValue, EnumerationColumnOptions, ExecutableQuery, ExecutionMode, ExecutionPlan, ExecutionPlanStep, ExecutionPlanStepKind, ExecutionPlanWarning, ExecutionStats, ExecutorOptions, FieldOperators, FormulaCell, FormulaColumnOptions, GQuery, GQueryErrorCode$1 as GQueryErrorCode, GQueryErrorOptions, Group, InMemorySheetSeed, InMemorySpreadsheetSeed, InMemoryTransportCall, IncludedRow, InferColumn, InferDatabaseRows, InferRow, InferTableRow, IntegerColumnOptions, JoinCardinality, JoinKind, JoinOptions, JoinPlan, JsonColumnOptions, JsonPrimitive, JsonValue, LegacyDecoder, LegacyNoMatch, MaterializedRow, MutationConflict, MutationOptions, MutationPatch, MutationResult, MutationStatus, NonEmptyKey, NumberColumnOptions, OrderClause, ParsedA1Range, PendingMutationReceipt$1 as PendingMutationReceipt, PredicateNode, PredicateOperator, QueryExecution, QueryMutationPatch, QuerySelection, RawCellData, RawExtendedValue, RawValuesApi, RelationCardinality, RelationDefinition, RelationKey, RelationKind, RelationMap, RelationOptions, RowAt, RowPatch, RowProvenance, RuntimeCacheAdapter, RuntimeErrorCode, RuntimeErrorOptions, RuntimeGenerationAdapter, SchemaCanonicalModeAdapter, SchemaCanonicalModeOptions, SchemaCanonicalModeResult, SchemaCanonicalState, SchemaCanonicalStatus, SchemaIssue, SchemaIssueCode, SchemaManagementAccess, SchemaMigrationAction, SchemaMigrationAdapter, SchemaMigrationOptions, SchemaMigrationResult, SchemaPlan, SchemaTableAudit, SelectionInternal, SelectionJSON, SelectionJsonValue, SelectionRuntime, SerializableQueryPlan, SheetBatchGetResult, SheetBatchUpdateOptions, SheetBatchUpdateResult, SheetCellFormat, SheetCellInput, SheetCellValue, SheetDateTimeRenderOption, SheetMajorDimension, SheetMetadata, SheetReadOptions, SheetUpdateResult, SheetValueInputOption, SheetValueRange, SheetValueRenderOption, SheetValueUpdate, SheetsTransport, SortDirection, SourceDefinition, SourceMap, SpreadsheetIdSourceDefinition, SpreadsheetMetadata, StructuredColumnOptions, SyncOptions, SyncResult, SystemCellRepairValue, SystemManagerAccess, SystemStatus, TableCacheDefinition, TableConfig, TableDefinition, TableHandles, TableMap, TextColumnOptions, TransportInvoker, TransportOperationContext, TransportOperationKind, TriggerSetup, UnitOfWorkCommitResult, UnitOfWorkIntent, UnitOfWorkOptions, UnitOfWorkResult, UpsertOptions, UpsertResult, Where, WorkbookCommitReceipt, WriteConstraintSnapshot };

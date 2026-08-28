@@ -5,6 +5,8 @@ export type SheetCellValue = string | number | boolean | null;
 
 /** Typed input accepted only by grid writes that preserve formula intent. */
 export type SheetCellInput = SheetCellValue | FormulaCell;
+/** Google Sheets `CellFormat` payload retained as a transport-neutral object. */
+export type SheetCellFormat = Readonly<Record<string, unknown>>;
 
 export type SheetMajorDimension = "ROWS" | "COLUMNS";
 export type SheetValueRenderOption =
@@ -36,6 +38,11 @@ export interface SheetMetadata {
   title: string;
   rowCount: number;
   columnCount: number;
+  /**
+   * Whether a non-warning protected range covers the complete sheet. `undefined`
+   * means the transport cannot report protection state.
+   */
+  hasFullSheetProtection?: boolean;
 }
 
 export interface SpreadsheetMetadata {
@@ -92,6 +99,19 @@ export interface AtomicRowAppend {
   kind: "appendRows";
   sheetId: number;
   values: readonly (readonly SheetCellInput[])[];
+  /** Optional formats aligned with `values`; omitted cells keep defaults. */
+  formats?: readonly (readonly (SheetCellFormat | null)[])[];
+}
+
+/** Apply one format to a rectangular range without changing cell values. */
+export interface AtomicCellFormat {
+  kind: "formatCells";
+  sheetId: number;
+  startRowIndex: number;
+  startColumnIndex: number;
+  rowCount: number;
+  columnCount: number;
+  format: SheetCellFormat;
 }
 
 /** A zero-based, end-exclusive row deletion. */
@@ -105,6 +125,7 @@ export interface AtomicRowDelete {
 export type AtomicMutation =
   | AtomicCellUpdate
   | AtomicRowAppend
+  | AtomicCellFormat
   | AtomicRowDelete;
 
 export interface AtomicBatchUpdateOptions {

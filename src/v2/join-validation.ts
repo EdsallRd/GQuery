@@ -1,4 +1,4 @@
-import type { SerializableQueryPlan, JoinPlan } from "./query";
+import type { SerializableQueryPlan, JoinPlan, PredicateNode } from "./query";
 import { GQueryRuntimeError } from "./runtime-errors";
 import type { DatabaseDefinition, TableDefinition, TableMap } from "./schema";
 
@@ -65,6 +65,110 @@ function missingFields(
   table: TableDefinition,
 ): readonly string[] {
   return fields.filter((field) => !(field in table.columns));
+}
+
+const PREDICATE_OPERATORS = new Set([
+  "eq", "ne", "in", "notIn", "gt", "gte", "lt", "lte", "between",
+  "contains", "startsWith", "endsWith", "isBlank", "isNull",
+]);
+
+function validatePredicate(
+  node: PredicateNode,
+  tableName: string,
+  table: TableDefinition,
+): void {
+  if (node === null || typeof node !== "object") {
+    invalidJoin(`Query for ${tableName} contains an invalid predicate node.`, { table: tableName, node });
+  }
+  if (node.kind === "constant") {
+    if (typeof node.value !== "boolean") {
+      invalidJoin(`Query for ${tableName} contains an invalid constant predicate.`, { table: tableName, node });
+    }
+    return;
+  }
+  if (node.kind === "field") {
+    if (!(node.field in table.columns)) {
+      invalidJoin(`Query for ${tableName} references unknown predicate field ${String(node.field)}.`, {
+        table: tableName,
+        field: node.field,
+        location: "predicate",
+      });
+    }
+    if (!PREDICATE_OPERATORS.has(node.operator)) {
+      invalidJoin(`Query for ${tableName} contains invalid predicate operator ${String(node.operator)}.`, {
+        table: tableName,
+        field: node.field,
+        operator: node.operator,
+      });
+    }
+    return;
+  }
+  if (node.kind === "not") {
+    validatePredicate(node.node, tableName, table);
+    return;
+  }
+  if (node.kind === "and" || node.kind === "or") {
+    if (!Array.isArray(node.nodes)) {
+      invalidJoin(`Query for ${tableName} contains an invalid ${node.kind} predicate.`, { table: tableName, node });
+    }
+    for (const child of node.nodes) validatePredicate(child, tableName, table);
+    return;
+  }
+  invalidJoin(`Query for ${tableName} contains an unknown predicate kind.`, { table: tableName, node });
+}
+
+function validateBaseQuery(plan: SerializableQueryPlan, table: TableDefinition): void {
+  if (plan.source !== table.source) {
+    invalidJoin(`Query for ${plan.table} has an invalid source ${String(plan.source)}.`, {
+      table: plan.table,
+      expectedSource: table.source,
+      actualSource: plan.source,
+    });
+  }
+  if (plan.predicate !== undefined) validatePredicate(plan.predicate, plan.table, table);
+
+  if (plan.projection !== undefined) {
+    if (!Array.isArray(plan.projection) || plan.projection.some((field) => typeof field !== "string" || field.length === 0)) {
+      invalidJoin(`Query for ${plan.table} select must be an array of field names.`, {
+        table: plan.table,
+        projection: plan.projection,
+      });
+    }
+    const missing = missingFields(plan.projection, table);
+    if (missing.length > 0) {
+      invalidJoin(`Query for ${plan.table} selects unknown field${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}.`, {
+        table: plan.table,
+        missing,
+        location: "projection",
+      });
+    }
+    if (new Set(plan.projection).size !== plan.projection.length) {
+      invalidJoin(`Query for ${plan.table} contains duplicate selected fields.`, {
+        table: plan.table,
+        projection: plan.projection,
+      });
+    }
+  }
+
+  if (!Array.isArray(plan.orderBy)) {
+    invalidJoin(`Query for ${plan.table} orderBy must be an array.`, { table: plan.table, orderBy: plan.orderBy });
+  }
+  for (const clause of plan.orderBy) {
+    if (clause === null || typeof clause !== "object" || !(clause.field in table.columns)) {
+      invalidJoin(`Query for ${plan.table} orders by unknown field ${String(clause?.field)}.`, {
+        table: plan.table,
+        field: clause?.field,
+        location: "orderBy",
+      });
+    }
+    if (clause.direction !== "asc" && clause.direction !== "desc") {
+      invalidJoin(`Query for ${plan.table} has invalid order direction ${String(clause.direction)}.`, {
+        table: plan.table,
+        field: clause.field,
+        direction: clause.direction,
+      });
+    }
+  }
 }
 
 function validateJoin(
@@ -168,6 +272,7 @@ export function validateJoinPlan(
 ): void {
   const tables = schema.tables as TableMap;
   const base = requireTable(tables, plan.table, "<base>");
+  validateBaseQuery(plan, base);
   const occupied = new Set(Object.keys(base.columns));
   for (const join of plan.joins) {
     const target = requireTable(tables, join.table, join.alias);

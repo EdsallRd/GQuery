@@ -24,6 +24,8 @@ export interface CodecContext {
   readonly column?: string;
   readonly header?: string;
   readonly rowNumber?: number;
+  /** Set to false after an explicit canonical-only migration cutover. */
+  readonly allowLegacy?: boolean;
 }
 
 export interface ColumnCodec<T> {
@@ -49,6 +51,8 @@ export interface ColumnDefinition<T> extends ColumnCodec<T> {
   readonly legacyDecoders: readonly LegacyDecoder<T>[];
   readonly blankPolicy: "reject" | "null" | "undefined" | "default";
   readonly acceptsNull: boolean;
+  /** Decode using only canonical encodings, including through wrapper codecs. */
+  decodeCanonical(value: unknown, context?: CodecContext): T;
 }
 
 export type InferColumn<C> = C extends {
@@ -117,6 +121,9 @@ type ColumnOptionsFor<T> = BaseColumnOptions<T>;
 
 const DEFAULT_MAX_CELL_CHARS = 48_000;
 const DEFAULT_MAX_DEPTH = 64;
+const TEXT_TAG_PREFIX = "gq:text:v1:";
+const EMPTY_TEXT_CELL = `${TEXT_TAG_PREFIX}empty`;
+const ESCAPED_TEXT_PREFIX = `${TEXT_TAG_PREFIX}escaped:`;
 
 function isBlank(value: unknown): value is BlankCell | undefined {
   return value === BLANK_CELL || value === undefined;
@@ -261,7 +268,7 @@ function freezeDefinition<T>(
         return codec.decode(value, context);
       } catch (canonicalError) {
         if (canonicalError instanceof GQueryCodecError) {
-          for (const decoder of tryLegacyDecoders ? legacyDecoders : []) {
+          for (const decoder of tryLegacyDecoders && context.allowLegacy !== false ? legacyDecoders : []) {
             try {
               const decoded = decoder(value, context);
               if (decoded !== LEGACY_NO_MATCH) return decoded;
@@ -287,6 +294,12 @@ function freezeDefinition<T>(
           canonicalError,
         );
       }
+    },
+    decodeCanonical(value: unknown, context: CodecContext = {}): T {
+      // `allowLegacy` is set last deliberately so callers cannot override the
+      // canonical-only contract. Wrapper codecs propagate the context to each
+      // child definition, bypassing legacy decoders at every composition layer.
+      return definition.decode(value, { ...context, allowLegacy: false });
     },
   };
 
@@ -407,8 +420,18 @@ export function text(options: TextColumnOptions = {}): ColumnDefinition<string> 
   };
   const codec: ColumnCodec<string> = Object.freeze({
     kind: "text",
-    encode: (value: string, context: CodecContext = {}) => transform(value, "encode", context),
-    decode: (value: unknown, context: CodecContext = {}) => transform(value, "decode", context),
+    encode: (value: string, context: CodecContext = {}) => {
+      const encoded = transform(value, "encode", context);
+      if (encoded.length === 0) return EMPTY_TEXT_CELL;
+      return encoded.startsWith(TEXT_TAG_PREFIX) ? `${ESCAPED_TEXT_PREFIX}${encoded}` : encoded;
+    },
+    decode: (value: unknown, context: CodecContext = {}) => {
+      if (value === EMPTY_TEXT_CELL) return transform("", "decode", context);
+      if (typeof value === "string" && value.startsWith(ESCAPED_TEXT_PREFIX)) {
+        return transform(value.slice(ESCAPED_TEXT_PREFIX.length), "decode", context);
+      }
+      return transform(value, "decode", context);
+    },
   });
   return freezeDefinition(codec, options);
 }
@@ -1102,6 +1125,14 @@ export function withDefault<T>(
   const codec: ColumnCodec<T> = Object.freeze({
     kind: column.kind,
     encode(value: T, context: CodecContext = {}) {
+      const fallback = resolveDefault();
+      const isDefault = Object.is(value, fallback) ||
+        (value instanceof Date && fallback instanceof Date && value.getTime() === fallback.getTime());
+      // A default blank policy intentionally maps the logical default back to
+      // a physical blank. This keeps blank-friendly application fields (for
+      // example DayOne's unconfirmed timestamps) visibly blank instead of
+      // storing the strict text codec's empty-string sentinel.
+      if (isDefault) return BLANK_CELL;
       return column.encode(value, context);
     },
     decode(value: unknown, context: CodecContext = {}) {

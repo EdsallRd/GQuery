@@ -27,7 +27,10 @@ export declare class ScopedRetryTransportInvoker implements TransportInvoker {
     private readonly options;
     private activeBudget;
     private depth;
+    private completedRetries;
     constructor(controller: RetryController, options?: ScopedRetryTransportInvokerOptions);
     run<T>(operation: () => T): T;
     invoke<T>(context: TransportOperationContext, operation: () => T): T;
+    /** Monotonic counter consumed by executor result telemetry. */
+    retryCount(): number;
 }

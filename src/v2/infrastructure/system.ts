@@ -12,12 +12,16 @@ export interface ManagedTriggerSpec {
 
 export interface InstalledTrigger extends ManagedTriggerSpec {
   readonly id: string;
+  /** True only when this reconciliation namespace durably owns the trigger ID. */
+  readonly managed?: boolean;
 }
 
 export interface TriggerPlatform {
   list(): readonly InstalledTrigger[];
   create(spec: ManagedTriggerSpec): InstalledTrigger;
   remove(id: string): void;
+  /** Persist ownership when an exact pre-existing trigger is adopted. */
+  manage?(trigger: InstalledTrigger): InstalledTrigger;
 }
 
 export interface TriggerConfiguration {
@@ -45,7 +49,7 @@ function sameTrigger(left: ManagedTriggerSpec, right: ManagedTriggerSpec): boole
   );
 }
 
-/** Reconciles only handlers named by the configuration and leaves unrelated project triggers alone. */
+/** Reconciles durably owned trigger IDs and leaves unrelated project triggers alone. */
 export class TriggerReconciler {
   public constructor(private readonly platform: TriggerPlatform) {}
 
@@ -74,21 +78,24 @@ export class TriggerReconciler {
     }
 
     const installed = [...this.platform.list()];
-    const managedHandlers = new Set(desired.map((spec) => spec.handler));
     const kept: InstalledTrigger[] = [];
     const used = new Set<string>();
     for (const spec of desired) {
-      const match = installed.find(
-        (candidate) => !used.has(candidate.id) && sameTrigger(candidate, spec),
-      );
+      const exact = (candidate: InstalledTrigger): boolean =>
+        !used.has(candidate.id) && sameTrigger(candidate, spec);
+      const match = installed.find((candidate) => candidate.managed === true && exact(candidate))
+        ?? installed.find(exact);
       if (match !== undefined) {
-        kept.push(match);
-        used.add(match.id);
+        const owned = match.managed === true || this.platform.manage === undefined
+          ? match
+          : this.platform.manage(match);
+        kept.push(owned);
+        used.add(owned.id);
       }
     }
 
     const removed = installed.filter(
-      (candidate) => managedHandlers.has(candidate.handler) && !used.has(candidate.id),
+      (candidate) => candidate.managed === true && !used.has(candidate.id),
     );
     for (const trigger of removed) this.platform.remove(trigger.id);
 
@@ -115,7 +122,7 @@ export class AppsScriptTriggerPlatform implements TriggerPlatform {
     return ScriptApp.getProjectTriggers().map((trigger) => {
       const id = trigger.getUniqueId();
       const stored = this.readMetadata(id);
-      if (stored !== null) return { ...stored.spec, id };
+      if (stored !== null) return { ...stored.spec, id, managed: true };
 
       const event = trigger.getEventType();
       const kind: ManagedTriggerKind = event === ScriptApp.EventType.ON_EDIT
@@ -136,6 +143,7 @@ export class AppsScriptTriggerPlatform implements TriggerPlatform {
         kind,
         handler: trigger.getHandlerFunction(),
         spreadsheetId,
+        managed: false,
       };
     });
   }
@@ -161,7 +169,18 @@ export class AppsScriptTriggerPlatform implements TriggerPlatform {
       ScriptApp.deleteTrigger(trigger);
       throw error;
     }
-    return { ...spec, id };
+    return { ...spec, id, managed: true };
+  }
+
+  public manage(trigger: InstalledTrigger): InstalledTrigger {
+    const spec: ManagedTriggerSpec = {
+      kind: trigger.kind,
+      handler: trigger.handler,
+      ...(trigger.spreadsheetId === undefined ? {} : { spreadsheetId: trigger.spreadsheetId }),
+      ...(trigger.everyMinutes === undefined ? {} : { everyMinutes: trigger.everyMinutes }),
+    };
+    this.properties.set(this.metadataKey(trigger.id), JSON.stringify({ version: 1, spec } satisfies StoredTriggerMetadata));
+    return { ...trigger, managed: true };
   }
 
   public remove(id: string): void {
@@ -251,10 +270,16 @@ export class SystemEventCoordinator {
       (candidate) => candidate.sourceId === event.sourceId && candidate.sheetId === event.sheetId,
     );
     if (table === undefined) return { invalidatedTables: [], invalidatedRows: 0 };
-    const keys = this.hooks.onRowsEdited?.(table, event) ?? [];
-    this.generations.invalidateTable(table.sourceId, table.table);
-    for (const key of keys) this.generations.invalidateRow(table.sourceId, table.table, key);
-    return { invalidatedTables: [table.table], invalidatedRows: keys.length };
+    try {
+      this.hooks.onRowsEdited?.(table, event);
+    } finally {
+      // Even malformed/cleared primary keys must not leave a pre-edit cached
+      // snapshot reachable when the hook reports a decoding problem.
+      this.generations.invalidateTable(table.sourceId, table.table);
+    }
+    // Current read caches consume table generations only. Row tokens remain a
+    // public opt-in invalidation primitive and must not leak one property per edit.
+    return { invalidatedTables: [table.table], invalidatedRows: 0 };
   }
 
   public handleNativeEdit(event: GoogleAppsScript.Events.SheetsOnEdit): SystemEventResult {

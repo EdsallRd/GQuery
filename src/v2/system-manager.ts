@@ -63,6 +63,16 @@ export class AppsScriptManualEditHooks implements ManualEditHooks {
     const endRow = event.rowStart + event.rowCount - 1;
     if (endRow < startRow) return [];
     const rowCount = endRow - startRow + 1;
+    const tableColumnIndexes = Object.entries(definition.columns).map(([field, column]) => {
+      const index = headers.indexOf(column.header ?? field);
+      if (index < 0) throw new GQueryRuntimeError("MISSING_HEADER", `Header ${column.header ?? field} is missing.`);
+      return index;
+    });
+    const physicalRows = sheet.getRange(startRow, 1, rowCount, lastColumn).getValues();
+    const populated = physicalRows.map((row) => tableColumnIndexes.some((index) => {
+      const value = row[index];
+      return value !== "" && value !== null && value !== undefined;
+    }));
 
     if (versionHeader !== undefined) {
       const versionIndex = headers.indexOf(versionHeader);
@@ -71,7 +81,11 @@ export class AppsScriptManualEditHooks implements ManualEditHooks {
       }
       const range = sheet.getRange(startRow, versionIndex + 1, rowCount, 1);
       const current = range.getValues();
-      range.setValues(current.map(([value]) => [typeof value === "number" && Number.isFinite(value) ? value + 1 : 1]));
+      range.setValues(current.map(([value], index) => [
+        populated[index]
+          ? typeof value === "number" && Number.isFinite(value) ? value + 1 : 1
+          : "",
+      ]));
     }
 
     if (definition.primaryKey.length === 0) return [];
@@ -81,14 +95,12 @@ export class AppsScriptManualEditHooks implements ManualEditHooks {
       if (index < 0) throw new GQueryRuntimeError("MISSING_HEADER", `Primary key header ${column.header ?? field} is missing.`);
       return index;
     });
-    const min = Math.min(...indexes);
-    const max = Math.max(...indexes);
-    const values = sheet.getRange(startRow, min + 1, rowCount, max - min + 1).getValues();
-    return values.map((row, offset) => {
+    return physicalRows.flatMap((row, offset) => {
+      if (!populated[offset]) return [];
       const result: Record<string, unknown> = {};
       definition.primaryKey.forEach((field, index) => {
         const column = definition.columns[field];
-        const raw = row[indexes[index] - min];
+        const raw = row[indexes[index]];
         result[field] = column.decode(raw === "" || raw === null || raw === undefined ? BLANK_CELL : raw, {
           table: table.table,
           column: field,
@@ -96,7 +108,7 @@ export class AppsScriptManualEditHooks implements ManualEditHooks {
           rowNumber: startRow + offset,
         });
       });
-      return result;
+      return [result];
     });
   }
 }
@@ -180,4 +192,3 @@ export class SystemManager {
     return this.access.generations;
   }
 }
-

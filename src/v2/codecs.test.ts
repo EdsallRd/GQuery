@@ -9,6 +9,7 @@ import {
   decimal,
   enumeration,
   formula,
+  identifier,
   integer,
   json,
   nullable,
@@ -97,6 +98,11 @@ describe("v2 scalar codecs", () => {
   it("does not collapse blank, empty string, null, and missing by default", () => {
     const strict = text();
     expect(strict.decode("")).toBe("");
+    const encodedEmpty = strict.encode("");
+    expect(encodedEmpty).not.toBe("");
+    expect(strict.decode(encodedEmpty)).toBe("");
+    const reservedLookingText = "gq:text:v1:empty";
+    expect(strict.decode(strict.encode(reservedLookingText))).toBe(reservedLookingText);
     expect(() => strict.decode(BLANK_CELL)).toThrowError(
       expect.objectContaining({ code: "CODEC_BLANK" }),
     );
@@ -112,6 +118,8 @@ describe("v2 scalar codecs", () => {
     expect(absent.decode(undefined)).toBeUndefined();
     expect(absent.encode(undefined)).toBe(BLANK_CELL);
     expect(defaulted.decode(BLANK_CELL)).toBe("unknown");
+    expect(defaulted.encode("unknown")).toBe(BLANK_CELL);
+    expect(withDefault(strict, "").encode("")).toBe(BLANK_CELL);
     expect(() => defaulted.encode(undefined as never)).toThrowError(
       expect.objectContaining({ code: "CODEC_BLANK" }),
     );
@@ -137,6 +145,29 @@ describe("v2 scalar codecs", () => {
     expect(active.decode("TRUE")).toBe(true);
     expect(legacyCalls).toBe(1);
     expect(() => active.decode("yes")).toThrowError(GQueryCodecError);
+    expect(() => active.decode("TRUE", { allowLegacy: false })).toThrowError(GQueryCodecError);
+  });
+
+  it("bypasses legacy decoders through identifier and blank-policy wrappers", () => {
+    const legacyIdentifier = identifier({
+      legacyDecoders: [
+        (value) => typeof value === "number" ? String(value) : LEGACY_NO_MATCH,
+      ],
+    });
+    const columns = [
+      legacyIdentifier,
+      nullable(legacyIdentifier),
+      optional(legacyIdentifier),
+      withDefault(legacyIdentifier, "missing"),
+    ] as const;
+
+    for (const column of columns) {
+      expect(column.decode(123)).toBe("123");
+      expect(() => column.decodeCanonical(123)).toThrowError(GQueryCodecError);
+      expect(() => column.decodeCanonical(123, { allowLegacy: true })).toThrowError(
+        GQueryCodecError,
+      );
+    }
   });
 });
 

@@ -58,6 +58,7 @@ export interface ScopedRetryTransportInvokerOptions extends RetryPolicy {
 export class ScopedRetryTransportInvoker implements TransportInvoker {
   private activeBudget: ExecutionBudget | null = null;
   private depth = 0;
+  private completedRetries = 0;
 
   public constructor(
     private readonly controller: RetryController,
@@ -90,9 +91,15 @@ export class ScopedRetryTransportInvoker implements TransportInvoker {
         baseDelayMs: this.options.baseDelayMs,
         maxDelayMs: this.options.maxDelayMs,
       });
+      this.completedRetries += result.stats.retries;
       this.options.onAttemptComplete?.(context, result.stats);
       return result.value;
     };
     return this.activeBudget === null ? this.run(execute) : execute();
+  }
+
+  /** Monotonic counter consumed by executor result telemetry. */
+  public retryCount(): number {
+    return this.completedRetries;
   }
 }

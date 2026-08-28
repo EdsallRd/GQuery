@@ -5,6 +5,7 @@ import type {
   SheetBatchGetResult,
   SheetBatchUpdateOptions,
   SheetBatchUpdateResult,
+  SheetCellValue,
   SheetMajorDimension,
   SheetReadOptions,
   SheetsTransport,
@@ -17,83 +18,29 @@ import type {
 } from "./contracts";
 import {
   cloneRawMatrix,
-  cloneSheetInputMatrix,
-  encodeAtomicRows,
   normalizeReturnedMatrix,
 } from "./raw-values";
+import {
+  ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT,
+  assertAtomicBatchPayloadSize,
+  atomicMutationToSheetsRequest,
+  utf8ByteLength,
+} from "./atomic-request";
+import { RequestPayloadTooLargeError } from "../infrastructure/errors";
+import {
+  columnIndexToLetter,
+  parseA1Range,
+  sheetNameFromRange,
+  sheetRange,
+} from "./a1";
+
+export { atomicMutationToSheetsRequest } from "./atomic-request";
 
 export interface AppsScriptSheetsTransportOptions {
   /** Override the global advanced Sheets service, primarily for tests. */
   service?: GoogleAppsScript.Sheets;
   /** Synchronous deadline/retry/telemetry interception point. */
   invoker?: TransportInvoker;
-}
-
-function nonNegativeInteger(name: string, value: number): void {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(`${name} must be a non-negative safe integer.`);
-  }
-}
-
-function nonEmptyMatrix(
-  values: readonly (readonly unknown[])[],
-  label: string,
-): void {
-  if (values.length === 0 || values.every((row) => row.length === 0)) {
-    throw new TypeError(`${label} must contain at least one cell.`);
-  }
-}
-
-export function atomicMutationToSheetsRequest(
-  mutation: AtomicMutation,
-): GoogleAppsScript.Sheets.Schema.Request {
-  nonNegativeInteger("sheetId", mutation.sheetId);
-
-  if (mutation.kind === "deleteRows") {
-    nonNegativeInteger("startRowIndex", mutation.startRowIndex);
-    nonNegativeInteger("endRowIndex", mutation.endRowIndex);
-    if (mutation.endRowIndex <= mutation.startRowIndex) {
-      throw new RangeError("endRowIndex must be greater than startRowIndex.");
-    }
-    return {
-      deleteDimension: {
-        range: {
-          sheetId: mutation.sheetId,
-          dimension: "ROWS",
-          startIndex: mutation.startRowIndex,
-          endIndex: mutation.endRowIndex,
-        },
-      },
-    };
-  }
-
-  const matrix = cloneSheetInputMatrix(mutation.values, `${mutation.kind}.values`);
-  nonEmptyMatrix(matrix, `${mutation.kind}.values`);
-  const rows = encodeAtomicRows(matrix) as GoogleAppsScript.Sheets.Schema.RowData[];
-
-  if (mutation.kind === "appendRows") {
-    return {
-      appendCells: {
-        sheetId: mutation.sheetId,
-        rows,
-        fields: "userEnteredValue",
-      },
-    };
-  }
-
-  nonNegativeInteger("startRowIndex", mutation.startRowIndex);
-  nonNegativeInteger("startColumnIndex", mutation.startColumnIndex);
-  return {
-    updateCells: {
-      start: {
-        sheetId: mutation.sheetId,
-        rowIndex: mutation.startRowIndex,
-        columnIndex: mutation.startColumnIndex,
-      },
-      rows,
-      fields: "userEnteredValue",
-    },
-  };
 }
 
 function normalizeDimension(
@@ -131,6 +78,159 @@ function normalizeUpdate(
       ? normalizeValueRange(response.updatedData, fallbackRange, fallbackDimension)
       : null,
   };
+}
+
+function valuesBatchPayloadBytes(
+  data: readonly GoogleAppsScript.Sheets.Schema.ValueRange[],
+  options: SheetBatchUpdateOptions,
+): number {
+  return utf8ByteLength(JSON.stringify({
+    data,
+    valueInputOption: options.valueInputOption ?? "RAW",
+    includeValuesInResponse: options.includeValuesInResponse,
+    responseValueRenderOption: options.responseValueRenderOption,
+    responseDateTimeRenderOption: options.responseDateTimeRenderOption,
+  }));
+}
+
+function valueRangeData(
+  update: SheetValueUpdate,
+): GoogleAppsScript.Sheets.Schema.ValueRange {
+  return {
+    range: update.range,
+    majorDimension: update.majorDimension ?? "ROWS",
+    values: cloneRawMatrix(update.values, `values for ${update.range}`),
+  };
+}
+
+function localCellRange(
+  sheetName: string | null,
+  startRowIndex: number,
+  startColumnIndex: number,
+  rowCount: number,
+  columnCount: number,
+): string {
+  const start = `${columnIndexToLetter(startColumnIndex)}${startRowIndex + 1}`;
+  const end = `${columnIndexToLetter(startColumnIndex + columnCount - 1)}${startRowIndex + rowCount}`;
+  const local = start === end ? start : `${start}:${end}`;
+  return sheetName === null ? local : sheetRange(sheetName, local);
+}
+
+/** Recursively split one oversized Values range along its declared dimension. */
+function splitValueUpdate(
+  update: SheetValueUpdate,
+  options: SheetBatchUpdateOptions,
+  rowOffset = 0,
+  columnOffset = 0,
+): readonly SheetValueUpdate[] {
+  const data = valueRangeData(update);
+  const bytes = valuesBatchPayloadBytes([data], options);
+  if (bytes <= ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT) return [update];
+
+  const values = data.values ?? [];
+  const majorDimension = update.majorDimension ?? "ROWS";
+  const parsed = parseA1Range(update.range);
+  if (parsed.startRowIndex === undefined || parsed.startColumnIndex === undefined) {
+    throw new RequestPayloadTooLargeError(
+      "values.batchUpdate",
+      bytes,
+      ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT,
+    );
+  }
+
+  const make = (
+    nextValues: readonly (readonly unknown[])[],
+    nextRowOffset: number,
+    nextColumnOffset: number,
+  ): SheetValueUpdate => {
+    const rowCount = majorDimension === "ROWS"
+      ? nextValues.length
+      : nextValues.reduce((maximum, column) => Math.max(maximum, column.length), 0);
+    const columnCount = majorDimension === "ROWS"
+      ? nextValues.reduce((maximum, row) => Math.max(maximum, row.length), 0)
+      : nextValues.length;
+    return {
+      range: localCellRange(
+        parsed.sheetName,
+        parsed.startRowIndex! + nextRowOffset,
+        parsed.startColumnIndex! + nextColumnOffset,
+        rowCount,
+        columnCount,
+      ),
+      values: nextValues as readonly (readonly SheetCellValue[])[],
+      majorDimension,
+    };
+  };
+
+  if (values.length > 1) {
+    const midpoint = Math.ceil(values.length / 2);
+    const left = make(values.slice(0, midpoint), rowOffset, columnOffset);
+    const right = make(
+      values.slice(midpoint),
+      rowOffset + (majorDimension === "ROWS" ? midpoint : 0),
+      columnOffset + (majorDimension === "COLUMNS" ? midpoint : 0),
+    );
+    return [
+      ...splitValueUpdate(left, options, 0, 0),
+      ...splitValueUpdate(right, options, 0, 0),
+    ];
+  }
+
+  const inner = values[0] ?? [];
+  if (inner.length > 1) {
+    const midpoint = Math.ceil(inner.length / 2);
+    const left = make([inner.slice(0, midpoint)], rowOffset, columnOffset);
+    const right = make(
+      [inner.slice(midpoint)],
+      rowOffset + (majorDimension === "COLUMNS" ? midpoint : 0),
+      columnOffset + (majorDimension === "ROWS" ? midpoint : 0),
+    );
+    return [
+      ...splitValueUpdate(left, options, 0, 0),
+      ...splitValueUpdate(right, options, 0, 0),
+    ];
+  }
+
+  throw new RequestPayloadTooLargeError(
+    "values.batchUpdate",
+    bytes,
+    ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT,
+  );
+}
+
+function chunkValueRanges(
+  data: readonly GoogleAppsScript.Sheets.Schema.ValueRange[],
+  options: SheetBatchUpdateOptions,
+): readonly (readonly GoogleAppsScript.Sheets.Schema.ValueRange[])[] {
+  const chunks: GoogleAppsScript.Sheets.Schema.ValueRange[][] = [];
+  let current: GoogleAppsScript.Sheets.Schema.ValueRange[] = [];
+  for (const valueRange of data) {
+    const candidate = [...current, valueRange];
+    const bytes = valuesBatchPayloadBytes(candidate, options);
+    if (bytes <= ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT) {
+      current = candidate;
+      continue;
+    }
+    if (current.length === 0) {
+      throw new RequestPayloadTooLargeError(
+        "values.batchUpdate",
+        bytes,
+        ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT,
+      );
+    }
+    chunks.push(current);
+    current = [valueRange];
+    const singleBytes = valuesBatchPayloadBytes(current, options);
+    if (singleBytes > ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT) {
+      throw new RequestPayloadTooLargeError(
+        "values.batchUpdate",
+        singleBytes,
+        ATOMIC_BATCH_PAYLOAD_BYTE_LIMIT,
+      );
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
 }
 
 export class AppsScriptSheetsTransport implements SheetsTransport {
@@ -171,13 +271,13 @@ export class AppsScriptSheetsTransport implements SheetsTransport {
         this.service().Spreadsheets.get(spreadsheetId, {
           includeGridData: false,
           fields:
-            "spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+            "spreadsheetId,sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)),protectedRanges(range,warningOnly))",
         }),
     );
 
     return {
       spreadsheetId: response?.spreadsheetId ?? spreadsheetId,
-      sheets: (response?.sheets ?? []).map(({ properties }) => {
+      sheets: (response?.sheets ?? []).map(({ properties, protectedRanges }) => {
         const sheetId = properties?.sheetId;
         const title = properties?.title;
         if (sheetId === undefined || title === undefined) {
@@ -188,6 +288,15 @@ export class AppsScriptSheetsTransport implements SheetsTransport {
           title,
           rowCount: properties?.gridProperties?.rowCount ?? 0,
           columnCount: properties?.gridProperties?.columnCount ?? 0,
+          hasFullSheetProtection: (protectedRanges ?? []).some((protection) => {
+            const range = protection.range;
+            return protection.warningOnly !== true &&
+              range?.sheetId === sheetId &&
+              range.startRowIndex === undefined &&
+              range.endRowIndex === undefined &&
+              range.startColumnIndex === undefined &&
+              range.endColumnIndex === undefined;
+          }),
         };
       }),
     };
@@ -267,49 +376,60 @@ export class AppsScriptSheetsTransport implements SheetsTransport {
       };
     }
 
-    const data: GoogleAppsScript.Sheets.Schema.ValueRange[] = updates.map(
-      (update) => ({
-        range: update.range,
-        majorDimension: update.majorDimension ?? "ROWS",
-        values: cloneRawMatrix(update.values, `values for ${update.range}`),
-      }),
-    );
-    const response = this.invoke(
-      {
-        kind: "batchUpdate",
-        operationClass: "idempotent-write",
-        spreadsheetId,
-        ranges: updates.map(({ range }) => range),
-        requestCount: updates.length,
-        idempotent: true,
-      },
-      () =>
-        this.service().Spreadsheets.Values.batchUpdate(
-          {
-            data,
-            valueInputOption: options.valueInputOption ?? "RAW",
-            includeValuesInResponse: options.includeValuesInResponse,
-            responseValueRenderOption: options.responseValueRenderOption,
-            responseDateTimeRenderOption: options.responseDateTimeRenderOption,
-          },
+    const expandedUpdates = updates.flatMap((update) => splitValueUpdate(update, options));
+    const data: GoogleAppsScript.Sheets.Schema.ValueRange[] = expandedUpdates.map(valueRangeData);
+    const chunks = chunkValueRanges(data, options);
+    const responses: SheetUpdateResult[] = [];
+    let totalUpdatedRows = 0;
+    let totalUpdatedColumns = 0;
+    let totalUpdatedCells = 0;
+    let updateIndex = 0;
+    for (const chunk of chunks) {
+      const chunkUpdates = expandedUpdates.slice(updateIndex, updateIndex + chunk.length);
+      const response = this.invoke(
+        {
+          kind: "batchUpdate",
+          operationClass: "idempotent-write",
           spreadsheetId,
-        ),
-    );
-
-    return {
-      spreadsheetId: response?.spreadsheetId ?? spreadsheetId,
-      totalUpdatedRows: response?.totalUpdatedRows ?? 0,
-      totalUpdatedColumns: response?.totalUpdatedColumns ?? 0,
-      totalUpdatedCells: response?.totalUpdatedCells ?? 0,
-      totalUpdatedSheets: response?.totalUpdatedSheets ?? 0,
-      responses: updates.map((update, index) =>
-        normalizeUpdate(
+          ranges: chunkUpdates.map(({ range }) => range),
+          requestCount: chunkUpdates.length,
+          idempotent: true,
+        },
+        () =>
+          this.service().Spreadsheets.Values.batchUpdate(
+            {
+              data: [...chunk],
+              valueInputOption: options.valueInputOption ?? "RAW",
+              includeValuesInResponse: options.includeValuesInResponse,
+              responseValueRenderOption: options.responseValueRenderOption,
+              responseDateTimeRenderOption: options.responseDateTimeRenderOption,
+            },
+            spreadsheetId,
+          ),
+      );
+      totalUpdatedRows += response?.totalUpdatedRows ?? 0;
+      totalUpdatedColumns += response?.totalUpdatedColumns ?? 0;
+      totalUpdatedCells += response?.totalUpdatedCells ?? 0;
+      chunkUpdates.forEach((update, index) => {
+        responses.push(normalizeUpdate(
           response?.responses?.[index],
           spreadsheetId,
           update.range,
           update.majorDimension ?? "ROWS",
-        ),
-      ),
+        ));
+      });
+      updateIndex += chunk.length;
+    }
+
+    return {
+      spreadsheetId,
+      totalUpdatedRows,
+      totalUpdatedColumns,
+      totalUpdatedCells,
+      totalUpdatedSheets: new Set(
+        expandedUpdates.map((update) => sheetNameFromRange(update.range) ?? "<default-sheet>"),
+      ).size,
+      responses,
     };
   }
 
@@ -322,6 +442,7 @@ export class AppsScriptSheetsTransport implements SheetsTransport {
       return { spreadsheetId, requestCount: 0, replies: [] };
     }
     const requests = mutations.map(atomicMutationToSheetsRequest);
+    assertAtomicBatchPayloadSize(requests, options);
     const operationClass = mutations.some(({ kind }) => kind === "appendRows")
       ? "append"
       : mutations.some(({ kind }) => kind === "deleteRows")
@@ -334,7 +455,9 @@ export class AppsScriptSheetsTransport implements SheetsTransport {
         spreadsheetId,
         ranges: [],
         requestCount: requests.length,
-        idempotent: mutations.every(({ kind }) => kind === "updateCells"),
+        idempotent: mutations.every(({ kind }) =>
+          kind === "updateCells" || kind === "formatCells"
+        ),
       },
       () =>
         this.service().Spreadsheets.batchUpdate(

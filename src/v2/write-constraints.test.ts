@@ -231,6 +231,43 @@ describe("write-time key constraints", () => {
   });
 });
 
+describe("sync and upsert key safety", () => {
+  it("requires an exact declared key and forbids preserving key fields", () => {
+    const { gq } = setup();
+    const invalid = expect.objectContaining({ code: "INVALID_QUERY" });
+
+    expect(() => gq.Accounts.upsertMany([], { keys: ["id"] }))
+      .toThrowError(invalid);
+    expect(() => gq.Accounts.sync([], { keys: ["display"] }))
+      .toThrowError(invalid);
+    expect(() => gq.Accounts.sync([], { keys: ["code", "tenant"] }))
+      .toThrowError(invalid);
+    expect(() => gq.Accounts.sync([], {
+      keys: ["tenant", "id"],
+      preserve: ["tenant"],
+    })).toThrowError(invalid);
+  });
+
+  it("rejects duplicate existing fingerprints instead of silently overwriting", () => {
+    const { transport, gq } = setup();
+    transport.atomicBatchUpdate("constraints-book", [{
+      kind: "appendRows",
+      sheetId: 1,
+      values: [[
+        "t9",
+        "a9",
+        "one@example.test",
+        "C9",
+        "Dirty duplicate",
+        1,
+      ]],
+    }]);
+
+    expect(() => gq.Accounts.upsertMany([], { keys: ["email"] }))
+      .toThrowError(expect.objectContaining({ code: "DUPLICATE_KEY" }));
+  });
+});
+
 describe("write-time required foreign keys", () => {
   it("rejects missing composite parents on immediate append and update", () => {
     const { transport, gq } = setup();
@@ -269,6 +306,26 @@ describe("write-time required foreign keys", () => {
       optionalParentId: null,
     });
     expect(result.status).toBe("committed");
+  });
+
+  it("rejects a populated optional relation whose target is missing", () => {
+    const { transport, gq } = setup();
+    transport.clearHistory();
+
+    const result = gq.Children.append({
+      id: "c2",
+      tenant: "t1",
+      parentId: "p1",
+      optionalParentId: "missing",
+    });
+
+    expect(result.status).toBe("conflicted");
+    expect(result.conflicts[0]).toMatchObject({
+      code: "foreign-key-missing",
+      expected: { relation: "optionalParent", targetTable: "Parents" },
+    });
+    expect(transport.history.some(({ kind }) => kind === "atomicBatchUpdate"))
+      .toBe(false);
   });
 
   it("resolves a composite parent inserted later in the same unit of work", () => {

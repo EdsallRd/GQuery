@@ -57,6 +57,15 @@ interface JournalState {
   readonly nextSequence: number;
   readonly entries: PendingDeferredMutation[];
   readonly receipts: PendingMutationReceipt[];
+  readonly flushLease?: JournalFlushLease;
+}
+
+interface JournalFlushLease {
+  readonly id: string;
+  readonly acquiredAtMs: number;
+  readonly expiresAtMs: number;
+  readonly snapshotRevision: number;
+  readonly entryIds: readonly string[];
 }
 
 interface JournalManifest {
@@ -104,6 +113,16 @@ export class JournalLockTimeoutError extends GQueryV2Error {
   }
 }
 
+export class JournalFlushLeaseLostError extends GQueryV2Error {
+  public constructor(leaseId: string) {
+    super(
+      "DEFERRED_CONFLICT",
+      "The deferred flush lease expired or was replaced before journal reconciliation.",
+      { leaseId },
+    );
+  }
+}
+
 export class IdempotencyConflictError extends GQueryV2Error {
   public constructor(idempotencyKey: string) {
     super(
@@ -114,13 +133,33 @@ export class IdempotencyConflictError extends GQueryV2Error {
   }
 }
 
+export class AppliedReceiptCapacityError extends GQueryV2Error {
+  public constructor(
+    sourceMutationCount: number,
+    retainedReceiptLimit: number,
+    bytes: number,
+    maximumBytes: number,
+  ) {
+    super(
+      "JOURNAL_CAPACITY",
+      `The deferred flush cannot durably checkpoint all ${sourceMutationCount} source mutations before commit. Split the flush or increase the bounded applied-receipt capacity.`,
+      { sourceMutationCount, retainedReceiptLimit, bytes, maximumBytes },
+    );
+  }
+}
+
 export interface DeferredOverlayPublisher {
   /** Cache-only optimization. Implementations must treat replace failures as recoverable. */
   replace(entries: readonly PendingDeferredMutation[]): void;
 }
 
+export interface DeferredOverlayReader {
+  /** Returns null after eviction/corruption so callers can rebuild from the journal. */
+  read(): readonly PendingDeferredMutation[] | null;
+}
+
 /** CacheService-backed overlay which remains explicitly rebuildable from the journal. */
-export class ChunkedDeferredOverlay implements DeferredOverlayPublisher {
+export class ChunkedDeferredOverlay implements DeferredOverlayPublisher, DeferredOverlayReader {
   public constructor(
     private readonly cache: ChunkedCache,
     private readonly logicalKey: unknown = { kind: "deferred-overlay" },
@@ -143,6 +182,11 @@ export interface DeferredJournalOptions {
   readonly maxMutationBytes?: number;
   readonly retainedReceiptLimit?: number;
   readonly lockTimeoutMs?: number;
+  /**
+   * Durable trigger-run fence. The default exceeds Apps Script's normal
+   * six-minute execution ceiling so a healthy flush cannot be overtaken.
+   */
+  readonly flushLeaseMs?: number;
 }
 
 export interface AppliedMutationReceiptLedgerOptions {
@@ -165,6 +209,8 @@ export interface DeferredJournalDependencies {
 export interface CoalescedDeferredMutation {
   readonly id: string;
   readonly sourceMutationIds: readonly string[];
+  /** Original ordered operations retained for crash-safe partial recomposition. */
+  readonly sourceMutations: readonly PendingDeferredMutation[];
   readonly sourceId: string;
   readonly table: string;
   readonly kind: DeferredMutationKind;
@@ -173,6 +219,8 @@ export interface CoalescedDeferredMutation {
   readonly expectedVersion?: string | number | null;
   readonly actor?: string;
   readonly firstSequence: number;
+  /** Encoded state written by a confirmed applied prefix of this group. */
+  readonly recoveryAppliedValues?: Readonly<Record<string, unknown>>;
 }
 
 export type DeferredOutcomeStatus = "committed" | "transient" | "conflict";
@@ -206,6 +254,18 @@ export interface DeferredDeadLetterSink {
   /** Must be idempotent by dead-letter id because persistence can fail after this call. */
   write(records: readonly DeferredDeadLetter[]): void;
 }
+
+export const DEFERRED_DEAD_LETTER_BASE_HEADERS = Object.freeze([
+  "ID",
+  "Mutation ID",
+  "Source",
+  "Table",
+  "Key",
+  "Conflict",
+  "Moved At",
+] as const);
+
+export const DEFERRED_DEAD_LETTER_ACTOR_HEADER = "Actor";
 
 export interface DeferredFlushResult {
   readonly attempted: number;
@@ -372,7 +432,7 @@ export class AppliedMutationReceiptLedger {
     options: AppliedMutationReceiptLedgerOptions = {},
   ) {
     this.namespace = options.namespace ?? "gq2";
-    this.retainedReceiptLimit = options.retainedReceiptLimit ?? 64;
+    this.retainedReceiptLimit = options.retainedReceiptLimit ?? 256;
     this.maximumBytes = options.maximumBytes ?? 8_000;
     this.maximumAgeMs = options.maximumAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
     this.clock = options.clock ?? systemClock;
@@ -388,24 +448,37 @@ export class AppliedMutationReceiptLedger {
   }
 
   public has(mutationId: string): boolean {
-    return this.pruned(this.load(), this.clock.now()).some(
+    return this.load().some(
       (receipt) => receipt.mutationId === mutationId,
     );
   }
 
   public mark(mutationId: string): void {
-    if (mutationId.trim().length === 0) throw new TypeError("Applied mutation IDs must not be empty.");
-    const now = this.clock.now();
-    const receipts = this.pruned(this.load(), now)
-      .filter((receipt) => receipt.mutationId !== mutationId);
-    receipts.push({ mutationId, appliedAtMs: now });
-    this.persist(this.fit(receipts));
+    this.markMany([mutationId]);
+  }
+
+  /** Publish all receipts in one bounded property write after an atomic batch. */
+  public markMany(mutationIds: readonly string[]): void {
+    if (mutationIds.length === 0) return;
+    if (mutationIds.some((mutationId) => mutationId.trim().length === 0)) {
+      throw new TypeError("Applied mutation IDs must not be empty.");
+    }
+    this.persist(this.markedState(mutationIds, this.clock.now()));
+  }
+
+  /** Refuse a flush before remote I/O when its full crash checkpoint cannot fit. */
+  public assertCanMarkMany(mutationIds: readonly string[]): void {
+    if (mutationIds.length === 0) return;
+    if (mutationIds.some((mutationId) => mutationId.trim().length === 0)) {
+      throw new TypeError("Applied mutation IDs must not be empty.");
+    }
+    this.markedState(mutationIds, this.clock.now());
   }
 
   public forget(mutationIds: readonly string[]): void {
     if (mutationIds.length === 0) return;
     const removed = new Set(mutationIds);
-    this.persist(this.pruned(this.load(), this.clock.now()).filter(
+    this.persist(this.load().filter(
       (receipt) => !removed.has(receipt.mutationId),
     ));
   }
@@ -418,7 +491,7 @@ export class AppliedMutationReceiptLedger {
   }
 
   public list(): readonly AppliedMutationReceipt[] {
-    return Object.freeze([...this.pruned(this.load(), this.clock.now())]);
+    return Object.freeze([...this.load()]);
   }
 
   private get key(): string {
@@ -462,10 +535,32 @@ export class AppliedMutationReceiptLedger {
   }
 
   private fit(receipts: readonly AppliedMutationReceipt[]): AppliedMutationReceipt[] {
-    const fitted = [...receipts];
+    const fitted = [...receipts].slice(-this.retainedReceiptLimit);
     while (fitted.length > 0 && this.serializedBytes(fitted) > this.maximumBytes) fitted.shift();
     if (fitted.length === 0 && receipts.length > 0) {
       throw new JournalCapacityError(this.serializedBytes(receipts.slice(-1)), this.maximumBytes);
+    }
+    return fitted;
+  }
+
+  private markedState(
+    mutationIds: readonly string[],
+    now: number,
+  ): AppliedMutationReceipt[] {
+    const marked = new Set(mutationIds);
+    const receipts = this.load()
+      .filter((receipt) => !marked.has(receipt.mutationId));
+    receipts.push(...[...marked].map((mutationId) => ({ mutationId, appliedAtMs: now })));
+    const fitted = this.fit(receipts);
+    if (receipts.some(({ mutationId }) =>
+      !fitted.some((receipt) => receipt.mutationId === mutationId)
+    )) {
+      throw new AppliedReceiptCapacityError(
+        receipts.length,
+        this.retainedReceiptLimit,
+        this.serializedBytes(receipts),
+        this.maximumBytes,
+      );
     }
     return fitted;
   }
@@ -498,31 +593,56 @@ function compatible(left: CoalescedDeferredMutation, right: PendingDeferredMutat
   }
   return (
     (left.kind === "patch" && right.kind === "patch") ||
-    (left.kind === "upsert" && (right.kind === "upsert" || right.kind === "patch"))
+    (left.kind === "patch" && right.kind === "delete") ||
+    (left.kind === "upsert" && (right.kind === "upsert" || right.kind === "patch" || right.kind === "delete")) ||
+    (left.kind === "create" && (right.kind === "patch" || right.kind === "upsert" || right.kind === "delete"))
   );
 }
 
-/** Only semantically compatible adjacent operations are combined; ordering is otherwise preserved. */
+function deferredTarget(mutation: Pick<PendingDeferredMutation, "sourceId" | "table" | "key">): string {
+  return `${mutation.sourceId}\u0000${mutation.table}\u0000${canonicalStringify(mutation.key)}`;
+}
+
+/**
+ * Combine compatible operations for one key even when unrelated keys are
+ * interleaved. The first occurrence retains its position, field values remain
+ * last-write-wins for that key, and an incompatible operation on the same key
+ * creates a semantic barrier for subsequent entries.
+ */
 export function coalesceDeferredMutations(
   entries: readonly PendingDeferredMutation[],
   hasher: HashFunction,
 ): CoalescedDeferredMutation[] {
   const result: CoalescedDeferredMutation[] = [];
+  const latestByTarget = new Map<string, number>();
   for (const entry of [...entries].sort((left, right) => left.sequence - right.sequence)) {
-    const previous = result[result.length - 1];
+    const target = deferredTarget(entry);
+    const previousIndex = latestByTarget.get(target);
+    const previous = previousIndex === undefined ? undefined : result[previousIndex];
     if (previous !== undefined && compatible(previous, entry)) {
       const combinedIds = [...previous.sourceMutationIds, entry.id];
-      result[result.length - 1] = {
+      const nextKind = entry.kind === "delete"
+        ? "delete"
+        : previous.kind === "create" && entry.kind === "upsert"
+          ? "upsert"
+          : previous.kind;
+      result[previousIndex!] = {
         ...previous,
         id: hasher.hash(combinedIds.join("\u0000")),
         sourceMutationIds: combinedIds,
-        values: { ...(previous.values ?? {}), ...(entry.values ?? {}) },
+        sourceMutations: [...previous.sourceMutations, entry],
+        kind: nextKind,
+        ...(nextKind === "delete"
+          ? { values: undefined }
+          : { values: { ...(previous.values ?? {}), ...(entry.values ?? {}) } }),
       };
       continue;
     }
+    latestByTarget.set(target, result.length);
     result.push({
       id: hasher.hash(entry.id),
       sourceMutationIds: [entry.id],
+      sourceMutations: [entry],
       sourceId: entry.sourceId,
       table: entry.table,
       kind: entry.kind,
@@ -545,6 +665,7 @@ export class DeferredJournal {
   private readonly maxMutationBytes: number;
   private readonly retainedReceiptLimit: number;
   private readonly lockTimeoutMs: number;
+  private readonly flushLeaseMs: number;
 
   public constructor(
     private readonly dependencies: DeferredJournalDependencies,
@@ -557,6 +678,7 @@ export class DeferredJournal {
     this.maxMutationBytes = options.maxMutationBytes ?? 32_000;
     this.retainedReceiptLimit = options.retainedReceiptLimit ?? 256;
     this.lockTimeoutMs = options.lockTimeoutMs ?? 5_000;
+    this.flushLeaseMs = options.flushLeaseMs ?? 7 * 60 * 1_000;
     if (!Number.isInteger(this.shardByteLimit) || this.shardByteLimit < 256 || this.shardByteLimit > 8_000) {
       throw new RangeError("Deferred journal shards must be between 256 and 8000 bytes.");
     }
@@ -565,6 +687,9 @@ export class DeferredJournal {
     }
     if (!Number.isInteger(this.maxMutationBytes) || this.maxMutationBytes < 1) {
       throw new RangeError("Deferred mutation size limit must be a positive integer.");
+    }
+    if (!Number.isInteger(this.flushLeaseMs) || this.flushLeaseMs < 1) {
+      throw new RangeError("Deferred flush lease duration must be a positive integer.");
     }
   }
 
@@ -602,7 +727,7 @@ export class DeferredJournal {
         updatedAtMs: now,
       };
       const next: JournalState = {
-        version: 1,
+        ...state,
         revision: state.revision + 1,
         nextSequence: state.nextSequence + 1,
         entries: [...state.entries, mutation],
@@ -637,6 +762,46 @@ export class DeferredJournal {
     return this.locked(() => [...this.load().entries].sort((left, right) => left.sequence - right.sequence));
   }
 
+  /** Read the authoritative journal and republish its cache-only overlay in one lock. */
+  public listAndRebuildOverlay(): readonly PendingDeferredMutation[] {
+    return this.locked(() => {
+      const entries = [...this.load().entries].sort((left, right) => left.sequence - right.sequence);
+      this.publishOverlay(entries);
+      return entries;
+    });
+  }
+
+  /**
+   * Read a manifest-last snapshot without taking the journal ScriptLock.
+   *
+   * This path is used only to rebuild the non-authoritative read-your-writes
+   * overlay. A query can already be running under the unit-of-work/document
+   * lock, so acquiring a second ScriptLock handle here risks a nested-lock
+   * timeout in Apps Script. The immutable shard generation is safe to read
+   * lock-free as long as the manifest remains unchanged for the duration of
+   * the read. A concurrent publication is retried against its new generation.
+   */
+  public readAndRebuildOverlay(): readonly PendingDeferredMutation[] {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const manifestBefore = this.dependencies.properties.get(this.manifestKey);
+      try {
+        const entries = [...this.load().entries].sort((left, right) => left.sequence - right.sequence);
+        const manifestAfter = this.dependencies.properties.get(this.manifestKey);
+        if (manifestBefore !== manifestAfter) continue;
+        this.publishOverlay(entries);
+        return entries;
+      } catch (error) {
+        lastError = error;
+        const manifestAfter = this.dependencies.properties.get(this.manifestKey);
+        if (manifestBefore !== manifestAfter) continue;
+        throw error;
+      }
+    }
+    if (lastError instanceof Error) throw lastError;
+    throw new JournalCorruptionError("manifest changed repeatedly while rebuilding the overlay");
+  }
+
   public receipt(idempotencyKey: string): PendingMutationReceipt | null {
     return this.locked(
       () => this.load().receipts.find((receipt) => receipt.idempotencyKey === idempotencyKey) ?? null,
@@ -655,21 +820,22 @@ export class DeferredJournal {
     executor: DeferredMutationBatchExecutor,
     deadLetters: DeferredDeadLetterSink,
   ): DeferredFlushResult {
-    return this.locked(() => this.flushLocked(executor, deadLetters));
-  }
+    const preparation = this.locked(() => this.prepareFlush());
+    if (preparation.kind === "idle") return preparation.result;
+    const { snapshot, lease } = preparation;
 
-  private flushLocked(
-    executor: DeferredMutationBatchExecutor,
-    deadLetters: DeferredDeadLetterSink,
-  ): DeferredFlushResult {
-    const snapshot = this.load();
-    // CacheService may evict early; every flush republishes the authoritative overlay.
-    this.publishOverlay(snapshot.entries);
-    if (snapshot.entries.length === 0) {
-      return { attempted: 0, committed: 0, conflicted: 0, retained: 0, coalesced: 0, errors: [] };
-    }
-
-    const coalesced = coalesceDeferredMutations(snapshot.entries, this.dependencies.hasher);
+    const grouped = coalesceDeferredMutations(snapshot.entries, this.dependencies.hasher);
+    const seenTargets = new Set<string>();
+    const coalesced = grouped.filter((mutation) => {
+      const target = deferredTarget(mutation);
+      if (seenTargets.has(target)) return false;
+      seenTargets.add(target);
+      return true;
+    });
+    const attempted = coalesced.reduce(
+      (count, mutation) => count + mutation.sourceMutationIds.length,
+      0,
+    );
     const errors: string[] = [];
     let outcomes: readonly DeferredMutationOutcome[];
     try {
@@ -729,50 +895,24 @@ export class DeferredJournal {
       for (const id of mutation.sourceMutationIds) outcomeForSourceId.set(id, effective);
     }
 
-    const now = this.clock.now();
-    const updated = (() => {
-      const current = this.load();
-      const removedIds = new Set<string>();
-      const entries = current.entries.flatMap((entry): PendingDeferredMutation[] => {
-        const outcome = outcomeForSourceId.get(entry.id);
-        if (outcome === undefined) return [entry];
-        if (outcome.status === "committed" || outcome.status === "conflict") {
-          removedIds.add(entry.id);
-          return [];
-        }
-        return [{
-          ...entry,
-          attempts: entry.attempts + 1,
-          lastAttemptAtMs: now,
-          lastError: outcome.message ?? "Transient deferred write failure",
-        }];
-      });
-      const receipts = current.receipts.map((receipt): PendingMutationReceipt => {
-        if (!removedIds.has(receipt.mutationId)) return receipt;
-        const outcome = outcomeForSourceId.get(receipt.mutationId);
-        if (outcome?.status === "conflict") {
-          return {
-            ...receipt,
-            status: "conflicted",
-            updatedAtMs: now,
-            conflict: outcome.conflict ?? { message: outcome.message ?? "Version conflict" },
-          };
-        }
-        return { ...receipt, status: "committed", updatedAtMs: now };
-      });
-      const next: JournalState = {
-        ...current,
-        revision: current.revision + 1,
-        entries,
-        receipts: pruneReceipts(receipts, this.retainedReceiptLimit),
-      };
-      this.persist(next);
-      return next;
-    })();
+    let updated: JournalState;
+    try {
+      updated = this.locked(() => this.reconcileFlush(lease, outcomeForSourceId));
+    } catch (error) {
+      // A failed manifest publication leaves the pre-reconciliation lease
+      // authoritative. Clear only our own lease so the applied-receipt ledger
+      // can support an immediate idempotent recovery run.
+      try {
+        this.locked(() => this.releaseFlushLease(lease.id));
+      } catch {
+        // The durable lease will expire even when best-effort cleanup fails.
+      }
+      throw error;
+    }
 
     const appliedIds = coalesced
       .filter((_, index) => normalizedOutcomes[index].status === "committed")
-      .map((mutation) => mutation.id);
+      .flatMap((mutation) => [mutation.id, ...mutation.sourceMutationIds]);
     if (appliedIds.length > 0 && executor.forgetApplied !== undefined) {
       try {
         executor.forgetApplied(appliedIds);
@@ -794,13 +934,121 @@ export class DeferredJournal {
       )
       .reduce((count, mutation) => count + mutation.sourceMutationIds.length, 0);
     return {
-      attempted: snapshot.entries.length,
+      attempted,
       committed,
       conflicted,
       retained: updated.entries.length,
-      coalesced: snapshot.entries.length - coalesced.length,
+      coalesced: attempted - coalesced.length,
       errors,
     };
+  }
+
+  private prepareFlush():
+    | { readonly kind: "idle"; readonly result: DeferredFlushResult }
+    | { readonly kind: "ready"; readonly snapshot: JournalState; readonly lease: JournalFlushLease } {
+    const state = this.load();
+    // CacheService may evict early; every trigger run republishes the
+    // authoritative overlay even when another flush owns the durable lease.
+    this.publishOverlay(state.entries);
+    const now = this.clock.now();
+    if (state.flushLease !== undefined && state.flushLease.expiresAtMs > now) {
+      return {
+        kind: "idle",
+        result: {
+          attempted: 0,
+          committed: 0,
+          conflicted: 0,
+          retained: state.entries.length,
+          coalesced: 0,
+          errors: [],
+        },
+      };
+    }
+
+    if (state.entries.length === 0) {
+      if (state.flushLease !== undefined) {
+        const { flushLease: _expiredLease, ...withoutLease } = state;
+        this.persist({ ...withoutLease, revision: state.revision + 1 });
+      }
+      return {
+        kind: "idle",
+        result: {
+          attempted: 0,
+          committed: 0,
+          conflicted: 0,
+          retained: 0,
+          coalesced: 0,
+          errors: [],
+        },
+      };
+    }
+
+    const lease: JournalFlushLease = {
+      id: this.dependencies.ids.next(),
+      acquiredAtMs: now,
+      expiresAtMs: now + this.flushLeaseMs,
+      snapshotRevision: state.revision,
+      entryIds: state.entries.map((entry) => entry.id),
+    };
+    this.persist({ ...state, revision: state.revision + 1, flushLease: lease });
+    return { kind: "ready", snapshot: state, lease };
+  }
+
+  private reconcileFlush(
+    lease: JournalFlushLease,
+    outcomeForSourceId: ReadonlyMap<string, DeferredMutationOutcome>,
+  ): JournalState {
+    const current = this.load();
+    if (current.flushLease?.id !== lease.id) throw new JournalFlushLeaseLostError(lease.id);
+
+    const leasedIds = new Set(lease.entryIds);
+    const removedIds = new Set<string>();
+    const now = this.clock.now();
+    const entries = current.entries.flatMap((entry): PendingDeferredMutation[] => {
+      // Concurrent enqueue calls are deliberately outside this flush snapshot.
+      if (!leasedIds.has(entry.id)) return [entry];
+      const outcome = outcomeForSourceId.get(entry.id);
+      if (outcome === undefined) return [entry];
+      if (outcome.status === "committed" || outcome.status === "conflict") {
+        removedIds.add(entry.id);
+        return [];
+      }
+      return [{
+        ...entry,
+        attempts: entry.attempts + 1,
+        lastAttemptAtMs: now,
+        lastError: outcome.message ?? "Transient deferred write failure",
+      }];
+    });
+    const receipts = current.receipts.map((receipt): PendingMutationReceipt => {
+      if (!removedIds.has(receipt.mutationId)) return receipt;
+      const outcome = outcomeForSourceId.get(receipt.mutationId);
+      if (outcome?.status === "conflict") {
+        return {
+          ...receipt,
+          status: "conflicted",
+          updatedAtMs: now,
+          conflict: outcome.conflict ?? { message: outcome.message ?? "Version conflict" },
+        };
+      }
+      return { ...receipt, status: "committed", updatedAtMs: now };
+    });
+    const { flushLease: _completedLease, ...withoutLease } = current;
+    const next: JournalState = {
+      ...withoutLease,
+      revision: current.revision + 1,
+      entries,
+      receipts: pruneReceipts(receipts, this.retainedReceiptLimit),
+    };
+    this.persist(next);
+    return next;
+  }
+
+  private releaseFlushLease(leaseId: string): void {
+    const current = this.load();
+    if (current.flushLease?.id !== leaseId) return;
+    const { flushLease: _lease, ...withoutLease } = current;
+    this.persist({ ...withoutLease, revision: current.revision + 1 });
   }
 
   private locked<T>(operation: () => T): T {
@@ -841,12 +1089,23 @@ export class DeferredJournal {
     }
     try {
       const state = JSON.parse(serialized) as JournalState;
+      const lease = state.flushLease;
       if (
         state.version !== 1 ||
         !Number.isInteger(state.revision) ||
         !Number.isInteger(state.nextSequence) ||
         !Array.isArray(state.entries) ||
         !Array.isArray(state.receipts) ||
+        (lease !== undefined && (
+          typeof lease !== "object" ||
+          lease === null ||
+          typeof lease.id !== "string" ||
+          !Number.isFinite(lease.acquiredAtMs) ||
+          !Number.isFinite(lease.expiresAtMs) ||
+          !Number.isInteger(lease.snapshotRevision) ||
+          !Array.isArray(lease.entryIds) ||
+          lease.entryIds.some((id) => typeof id !== "string")
+        )) ||
         state.revision !== manifest.revision
       ) {
         throw new Error("invalid state shape");

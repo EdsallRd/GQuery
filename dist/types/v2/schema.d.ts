@@ -52,6 +52,7 @@ export interface TableCacheDefinition<Columns extends ColumnMap = ColumnMap> {
     readonly ttlSeconds: number;
     readonly jitterSeconds?: number;
     readonly indexes?: readonly (readonly ColumnKey<Columns>[])[];
+    readonly tags?: readonly string[];
     readonly allowStaleOnQuota?: boolean;
 }
 export type NonEmptyKey<Columns extends ColumnMap> = readonly [
@@ -83,6 +84,7 @@ type TableInput = {
         readonly ttlSeconds: number;
         readonly jitterSeconds?: number;
         readonly indexes?: readonly (readonly string[])[];
+        readonly tags?: readonly string[];
         readonly allowStaleOnQuota?: boolean;
     };
     readonly appendOnly?: boolean;

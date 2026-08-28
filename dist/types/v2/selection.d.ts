@@ -2,7 +2,7 @@ import type { ExecutionStats } from "./execution";
 import type { MaterializedRow, RowProvenance } from "./provenance";
 export type MutationStatus = "committed" | "queued" | "conflicted";
 export interface MutationConflict {
-    readonly code: "missing" | "key-changed" | "version-changed" | "schema-changed" | "duplicate-key";
+    readonly code: "missing" | "key-changed" | "version-changed" | "schema-changed" | "duplicate-key" | "foreign-key-missing";
     readonly table: string;
     readonly key: Readonly<Record<string, unknown>>;
     readonly rowIndex?: number;
@@ -52,6 +52,15 @@ export interface SelectionInternal<T extends Record<string, unknown>> {
     readonly refresh: (() => Selection<T>) | null;
     readonly fanoutRequired: boolean;
 }
+export type SelectionJsonValue = null | boolean | number | string | readonly SelectionJsonValue[] | {
+    readonly [key: string]: SelectionJsonValue;
+};
+export interface SelectionJSON {
+    readonly headers: readonly string[];
+    readonly rows: readonly {
+        readonly [key: string]: SelectionJsonValue;
+    }[];
+}
 type RelatedRow<Value> = NonNullable<Value> extends readonly (infer Item)[] ? Extract<Item, Record<string, unknown>> : Extract<NonNullable<Value>, Record<string, unknown>>;
 /**
  * An immutable result set. Its public data is serializable; physical row
@@ -64,10 +73,7 @@ export declare class Selection<T extends Record<string, unknown>> {
     readonly [SELECTION_INTERNAL]: SelectionInternal<T>;
     constructor(materialized: readonly MaterializedRow<T>[], headers: readonly (keyof T & string)[], stats: ExecutionStats, runtime: SelectionRuntime, refresh?: (() => Selection<T>) | null, fanoutRequired?: boolean);
     get length(): number;
-    toJSON(): {
-        readonly headers: readonly (keyof T & string)[];
-        readonly rows: readonly Readonly<T>[];
-    };
+    toJSON(): SelectionJSON;
     refresh(): Selection<T>;
     update(patch: MutationPatch<T>, options?: MutationOptions): MutationResult<T>;
     delete(options?: DeleteOptions): MutationResult<T>;

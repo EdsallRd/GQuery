@@ -13,7 +13,8 @@ export type GQueryErrorCode =
   | "JOURNAL_ENTRY_TOO_LARGE"
   | "JOURNAL_CORRUPT"
   | "JOURNAL_LOCK_TIMEOUT"
-  | "DEFERRED_CONFLICT";
+  | "DEFERRED_CONFLICT"
+  | "REQUEST_TOO_LARGE";
 
 export class GQueryV2Error extends Error {
   public readonly cause?: unknown;
@@ -27,6 +28,16 @@ export class GQueryV2Error extends Error {
     super(message);
     this.name = new.target.name;
     this.cause = cause;
+  }
+}
+
+export class RequestPayloadTooLargeError extends GQueryV2Error {
+  public constructor(operationKind: string, bytes: number, maximumBytes: number) {
+    super(
+      "REQUEST_TOO_LARGE",
+      `The ${operationKind} payload is ${bytes} bytes, above the ${maximumBytes}-byte safety limit. Split the unit of work before retrying.`,
+      { operationKind, bytes, maximumBytes },
+    );
   }
 }
 

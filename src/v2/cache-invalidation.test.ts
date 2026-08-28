@@ -181,6 +181,48 @@ describe("public cache invalidation", () => {
     expectRuntimeCode(() => db.cache.invalidateTag("not-declared"), "INVALID_QUERY");
   });
 
+  it("does not allocate unused row-generation properties for automatic writes", () => {
+    const writeSchema = defineDatabase({
+      version: 2,
+      sources: { main: source.byId("write-book") },
+      tables: {
+        Assets: table({
+          source: "main",
+          sheet: "Assets",
+          primaryKey: ["serial"],
+          columns: {
+            serial: text({ header: "Serial" }),
+            status: text({ header: "Status" }),
+          },
+        }),
+      },
+    });
+    const generations = generationStore();
+    const transport = new InMemorySheetsTransport([{
+      spreadsheetId: "write-book",
+      sheets: [{
+        sheetId: 1,
+        title: "Assets",
+        values: [["Serial", "Status"], ["SX1", "Assigned"]],
+      }],
+    }]);
+    const db = createGQuery(writeSchema, { transport, generations });
+
+    expect(db.Assets.where({ serial: "SX1" }).maybeOne().update({ status: "Available" }).status)
+      .toBe("committed");
+    expect(generations.current({
+      kind: "table",
+      sourceId: "write-book",
+      table: "Assets",
+    })).not.toBe("0");
+    expect(generations.current({
+      kind: "row",
+      sourceId: "write-book",
+      table: "Assets",
+      key: { serial: "SX1" },
+    })).toBe("0");
+  });
+
   it("raises structured unsupported-operation errors when no generation store is configured", () => {
     const db = createGQuery(schema, { transport: new InMemorySheetsTransport() });
 

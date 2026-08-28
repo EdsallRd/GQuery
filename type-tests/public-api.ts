@@ -46,6 +46,9 @@ const filtered = db.Assets.where({ serial: { $startsWith: "SX" }, site: { $in: [
 const included = filtered.include("model").get();
 included.rows[0].model?.cost.toFixed();
 included.related("model").update({ name: "renamed" });
+included.update((draft) => ({ modelId: draft.model?.id ?? draft.modelId }));
+// @ts-expect-error related aliases require explicit related(name).update(...)
+included.update({ model: { id: "m2", name: "Tablet", cost: 400, display: "=B2" } });
 db.Assets.find({ serial: "SX1", site: "A" });
 db.Assets.select(["serial", "site"] as const).get().rows[0].serial.toUpperCase();
 
@@ -57,6 +60,15 @@ batch.assets.rows[0].serial.toUpperCase();
 batch.models.rows[0].cost.toFixed();
 batch.models.rows[0].display.toUpperCase();
 db.Models.where({ id: "m1" }).get().update({ display: "=A2&\" model\"" });
+db.Models.where({ name: { $isNull: false } });
+db.Models.append(
+  { id: "m2", name: "Tablet", cost: 400, display: "=B2" },
+  { delivery: "deferred", idempotencyKey: "create-m2" },
+);
+db.Models.upsertMany(
+  [{ id: "m2", name: "Tablet", cost: 450, display: "=B2" }],
+  { delivery: "deferred", idempotencyKey: "upsert-m2" },
+);
 
 const projectedInner = db.Assets.join(db.Models, {
   as: "modelInfo",

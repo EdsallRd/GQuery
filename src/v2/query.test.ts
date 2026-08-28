@@ -38,6 +38,18 @@ describe("v2 object query DSL", () => {
     expect(evaluatePredicate(predicate, { active: false, grade: 10 })).toBe(false);
   });
 
+  it("distinguishes logical null from blank and missing values", () => {
+    const isNull = normalizeWhere({ value: { $isNull: true } });
+    const isNotNull = normalizeWhere({ value: { $isNull: false } });
+
+    expect(evaluatePredicate(isNull, { value: null })).toBe(true);
+    expect(evaluatePredicate(isNull, { value: "" })).toBe(false);
+    expect(evaluatePredicate(isNull, {})).toBe(false);
+    expect(evaluatePredicate(isNotNull, { value: "" })).toBe(true);
+    expect(() => normalizeWhere({ value: { $isNull: "yes" } } as never))
+      .toThrowError("$isNull expects a boolean.");
+  });
+
   it("fingerprints object key order deterministically", () => {
     expect(canonicalStringify({ b: 2, a: 1 })).toBe(canonicalStringify({ a: 1, b: 2 }));
     expect(hashCanonical({ b: 2, a: 1 })).toBe(hashCanonical({ a: 1, b: 2 }));

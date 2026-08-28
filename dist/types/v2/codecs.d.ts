@@ -18,6 +18,8 @@ export interface CodecContext {
     readonly column?: string;
     readonly header?: string;
     readonly rowNumber?: number;
+    /** Set to false after an explicit canonical-only migration cutover. */
+    readonly allowLegacy?: boolean;
 }
 export interface ColumnCodec<T> {
     readonly kind: string;
@@ -36,6 +38,8 @@ export interface ColumnDefinition<T> extends ColumnCodec<T> {
     readonly legacyDecoders: readonly LegacyDecoder<T>[];
     readonly blankPolicy: "reject" | "null" | "undefined" | "default";
     readonly acceptsNull: boolean;
+    /** Decode using only canonical encodings, including through wrapper codecs. */
+    decodeCanonical(value: unknown, context?: CodecContext): T;
 }
 export type InferColumn<C> = C extends {
     readonly __gqueryColumn: true;

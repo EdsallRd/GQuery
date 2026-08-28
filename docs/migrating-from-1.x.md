@@ -22,7 +22,9 @@ GQuery 2.0 intentionally does not provide a v1 compatibility facade. Keep produc
 2. Register legacy decoders for historical booleans, dates, identifiers, JSON, and blank conventions.
 3. Run `db.schema.plan()` and resolve every ambiguous or invalid cell without writing.
 4. Run `db.schema.migrate({confirm: true, createBackups: true})` to take a full copy, create system sheets, and add hidden row-version columns.
-5. Enable dual decoding and canonical writes, then run an explicit backfill after reviewing the plan.
-6. Verify row counts, keys, relations, DTOs, and application-level shadow comparisons.
-7. Cut over behind a feature flag and keep the 1.x rollback path until the observation window passes.
+5. Enable dual decoding and canonical writes, then run the reviewed canonical backfill with `db.schema.migrate({confirm: true, createBackups: true, includeBackfill: true})`.
+6. Verify row counts, keys, relations, DTOs, and application-level shadow comparisons; rerun `schema.plan()` until it reports no legacy cells or pending actions.
+7. Call `db.schema.activateStrictCanonical({confirm: true})`. This is an explicit, audit-gated switch; use `rollbackStrictCanonical({confirm: true})` to restore dual decoding without rewriting cells.
+8. Cut over behind a feature flag and keep the 1.x rollback path until the observation window passes.
 
+The beta backfill is idempotent but currently applied in one migration invocation; checkpoint/resume controls are not yet public. For large workbooks, keep strict mode disabled, split legacy cleanup operationally, and rerun the audit before invoking the final backfill and strict-mode gate.

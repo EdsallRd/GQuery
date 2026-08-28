@@ -34,6 +34,8 @@ export interface ExecutionStats {
     elapsedMs: number;
     lockWaitMs: number;
     fullScans: number;
+    /** Additional related rows beyond one match per base row. */
+    joinFanOut: number;
     rangesRead: string[];
     rangesWritten: string[];
 }

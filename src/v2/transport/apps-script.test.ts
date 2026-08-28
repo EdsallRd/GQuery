@@ -103,6 +103,57 @@ describe("AppsScriptSheetsTransport", () => {
     expect(valuesBatchUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it("splits idempotent Values batches below the request safety ceiling", () => {
+    const { service, valuesBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+
+    const result = transport.batchUpdate("book", [
+      { range: "'Assets'!A2", values: [["a".repeat(950_000)]] },
+      { range: "'Assets'!A3", values: [["b".repeat(950_000)]] },
+    ]);
+
+    expect(valuesBatchUpdate).toHaveBeenCalledTimes(2);
+    expect(valuesBatchUpdate.mock.calls[0][0].data).toHaveLength(1);
+    expect(valuesBatchUpdate.mock.calls[1][0].data).toHaveLength(1);
+    expect(result.responses.map((response) => response.updatedRange)).toEqual([
+      "'Assets'!A2:B2",
+      "'Assets'!A2:B2",
+    ]);
+  });
+
+  it("splits one oversized Values range along its row dimension", () => {
+    const { service, valuesBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+
+    const result = transport.batchUpdate("book", [{
+      range: "'Assets'!A2:A51",
+      values: Array.from({ length: 50 }, () => ["x".repeat(40_000)]),
+    }]);
+
+    expect(valuesBatchUpdate).toHaveBeenCalledTimes(2);
+    expect(valuesBatchUpdate.mock.calls.map((call) => call[0].data[0].range)).toEqual([
+      "'Assets'!A2:A26",
+      "'Assets'!A27:A51",
+    ]);
+    expect(result.responses).toHaveLength(2);
+  });
+
+  it("adjusts row offsets when splitting an oversized column-major range", () => {
+    const { service, valuesBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+
+    transport.batchUpdate("book", [{
+      range: "'Assets'!A2:A51",
+      majorDimension: "COLUMNS",
+      values: [Array.from({ length: 50 }, () => "x".repeat(40_000))],
+    }]);
+
+    expect(valuesBatchUpdate.mock.calls.map((call) => call[0].data[0].range)).toEqual([
+      "'Assets'!A2:A26",
+      "'Assets'!A27:A51",
+    ]);
+  });
+
   it("encodes typed cells, appends, and bottom-up deletes in one atomic call", () => {
     const { service, atomicBatchUpdate } = fakeService();
     const transport = new AppsScriptSheetsTransport({ service });
@@ -142,6 +193,80 @@ describe("AppsScriptSheetsTransport", () => {
     expect(atomicBatchUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it("compiles schema formats into atomic repeat and append requests", () => {
+    const { service, atomicBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+    const numberFormat = { numberFormat: { type: "DATE", pattern: "yyyy-mm-dd" } };
+
+    transport.atomicBatchUpdate("book", [
+      {
+        kind: "formatCells",
+        sheetId: 7,
+        startRowIndex: 1,
+        startColumnIndex: 2,
+        rowCount: 1,
+        columnCount: 1,
+        format: numberFormat,
+      },
+      {
+        kind: "appendRows",
+        sheetId: 7,
+        values: [["003", 45_000]],
+        formats: [[numberFormat, numberFormat]],
+      },
+    ]);
+
+    const requests = atomicBatchUpdate.mock.calls[0][0].requests;
+    expect(requests[0].repeatCell).toEqual(expect.objectContaining({
+      fields: "userEnteredFormat.numberFormat.pattern,userEnteredFormat.numberFormat.type",
+      cell: { userEnteredFormat: numberFormat },
+    }));
+    expect(requests[1].appendCells.fields).toBe(
+      "userEnteredValue,userEnteredFormat.numberFormat.pattern,userEnteredFormat.numberFormat.type",
+    );
+    expect(requests[1].appendCells.rows[0].values[1].userEnteredFormat).toEqual(numberFormat);
+  });
+
+  it("rejects partial append format masks that could clear unrelated formatting", () => {
+    const { service, atomicBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+
+    expect(() => transport.atomicBatchUpdate("book", [{
+      kind: "appendRows",
+      sheetId: 7,
+      values: [["003", 45_000]],
+      formats: [[null, { numberFormat: { type: "DATE" } }]],
+    }])).toThrow(/partial append masks could erase/i);
+    expect(atomicBatchUpdate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized atomic request with a structured error before calling Sheets", () => {
+    const { service, atomicBatchUpdate } = fakeService();
+    const transport = new AppsScriptSheetsTransport({ service });
+    let failure: unknown;
+    try {
+      transport.atomicBatchUpdate("book", [{
+        kind: "updateCells",
+        sheetId: 7,
+        startRowIndex: 1,
+        startColumnIndex: 0,
+        values: [["x".repeat(1_800_000)]],
+      }]);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      code: "REQUEST_TOO_LARGE",
+      details: {
+        operationKind: "atomicBatchUpdate",
+        maximumBytes: 1_800_000,
+        bytes: expect.any(Number),
+      },
+    });
+    expect(atomicBatchUpdate).not.toHaveBeenCalled();
+  });
+
   it("resolves physical sheet metadata without grid data", () => {
     const { service, metadataGet } = fakeService();
     const transport = new AppsScriptSheetsTransport({ service });
@@ -150,6 +275,7 @@ describe("AppsScriptSheetsTransport", () => {
       title: "Assets",
       rowCount: 100,
       columnCount: 12,
+      hasFullSheetProtection: false,
     });
     expect(metadataGet).toHaveBeenCalledWith(
       "book",

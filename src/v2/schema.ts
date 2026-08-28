@@ -4,6 +4,10 @@ import {
   isColumnDefinition,
 } from "./codecs";
 import { GQueryDefinitionError } from "./errors";
+import {
+  isGQuerySystemSheetName,
+  isReservedTablePropertyName,
+} from "./reserved";
 
 // `any` is intentional in heterogeneous definition maps. The concrete value type
 // remains available through each ColumnDefinition and InferColumn/InferRow.
@@ -358,6 +362,12 @@ export function table<
   if (config.sheet.trim().length === 0) {
     throw new GQueryDefinitionError("Table sheet name must not be empty.");
   }
+  if (isGQuerySystemSheetName(config.sheet)) {
+    throw new GQueryDefinitionError(
+      `Table sheet ${config.sheet} is reserved for GQuery system state.`,
+      { sheet: config.sheet },
+    );
+  }
   if (config.versionColumn !== undefined && config.versionColumn.trim().length === 0) {
     throw new GQueryDefinitionError("Table versionColumn must not be empty.");
   }
@@ -380,6 +390,34 @@ export function table<
       );
     }
     seenHeaders.add(header);
+  }
+
+  if (config.versionColumn !== undefined) {
+    const physicalCollision = Object.entries(columns).find(([, column]) =>
+      (column.header ?? "") === config.versionColumn
+    );
+    if (physicalCollision !== undefined) {
+      throw new GQueryDefinitionError(
+        `Table ${config.sheet} versionColumn ${config.versionColumn} collides with the physical header of column ${physicalCollision[0]}.`,
+        {
+          table: config.sheet,
+          versionColumn: config.versionColumn,
+          column: physicalCollision[0],
+          collision: "physical-header",
+        },
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(columns, config.versionColumn)) {
+      throw new GQueryDefinitionError(
+        `Table ${config.sheet} versionColumn ${config.versionColumn} collides with a logical column property of the same name.`,
+        {
+          table: config.sheet,
+          versionColumn: config.versionColumn,
+          column: config.versionColumn,
+          collision: "logical-property",
+        },
+      );
+    }
   }
 
   const columnNameSet = new Set(columnNames);
@@ -558,6 +596,12 @@ export function defineDatabase<
   for (const [name, definition] of Object.entries(tables)) {
     if (name.trim().length === 0) {
       throw new GQueryDefinitionError("Database table names must not be empty.");
+    }
+    if (isReservedTablePropertyName(name)) {
+      throw new GQueryDefinitionError(
+        `Database table name ${name} is reserved by GQuery.`,
+        { table: name },
+      );
     }
     if (
       typeof definition !== "object" ||

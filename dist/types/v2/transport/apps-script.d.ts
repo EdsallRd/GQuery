@@ -1,11 +1,11 @@
 import type { AtomicBatchUpdateOptions, AtomicBatchUpdateResult, AtomicMutation, SheetBatchGetResult, SheetBatchUpdateOptions, SheetBatchUpdateResult, SheetReadOptions, SheetsTransport, SpreadsheetMetadata, SheetValueRange, SheetValueUpdate, TransportInvoker } from "./contracts";
+export { atomicMutationToSheetsRequest } from "./atomic-request";
 export interface AppsScriptSheetsTransportOptions {
     /** Override the global advanced Sheets service, primarily for tests. */
     service?: GoogleAppsScript.Sheets;
     /** Synchronous deadline/retry/telemetry interception point. */
     invoker?: TransportInvoker;
 }
-export declare function atomicMutationToSheetsRequest(mutation: AtomicMutation): GoogleAppsScript.Sheets.Schema.Request;
 export declare class AppsScriptSheetsTransport implements SheetsTransport {
     private readonly injectedService?;
     private readonly invoker?;

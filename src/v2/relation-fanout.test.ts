@@ -96,10 +96,14 @@ describe("declared to-many mutation fan-out", () => {
 
   it("continues to require fanout for multiple children", () => {
     const { transport, gq } = setup();
-    const children = gq.Parents.where({ id: "p2" })
-      .include("children")
-      .maybeOne()
-      .related("children");
+    const query = gq.Parents.where({ id: "p2" }).include("children");
+    expect(query.explain().warnings).toContainEqual(expect.objectContaining({
+      code: "JOIN_FANOUT",
+      table: "Children",
+    }));
+    const parent = query.maybeOne();
+    expect(parent.stats.joinFanOut).toBe(1);
+    const children = parent.related("children");
     expect(children.length).toBe(2);
 
     expect(() => children.delete()).toThrowError(

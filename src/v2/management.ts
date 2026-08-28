@@ -1,5 +1,14 @@
 import { BLANK_CELL, type EncodedCell } from "./codecs";
-import { hashCanonical } from "./query";
+import { canonicalStringify, hashCanonical } from "./query";
+import { GQUERY_SYSTEM_SHEET_NAMES } from "./reserved";
+import {
+  DEFERRED_DEAD_LETTER_ACTOR_HEADER,
+  DEFERRED_DEAD_LETTER_BASE_HEADERS,
+} from "./infrastructure/deferred";
+import {
+  AppsScriptPropertyStore,
+  type PropertyStore,
+} from "./infrastructure/runtime";
 import { GQueryRuntimeError } from "./runtime-errors";
 import type { DatabaseDefinition, TableDefinition } from "./schema";
 import {
@@ -15,13 +24,21 @@ export type SchemaIssueCode =
   | "MISSING_SHEET"
   | "MISSING_HEADER"
   | "MISSING_VERSION_COLUMN"
+  | "INVALID_VERSION"
   | "DUPLICATE_HEADER"
   | "INVALID_CELL"
   | "LEGACY_ENCODING"
   | "DUPLICATE_PRIMARY_KEY"
   | "DUPLICATE_UNIQUE_KEY"
   | "RELATION_CARDINALITY"
-  | "BROKEN_RELATION";
+  | "BROKEN_RELATION"
+  | "INVALID_SYSTEM_SHEET"
+  | "UNPROTECTED_SYSTEM_SHEET";
+
+export type SystemCellRepairValue =
+  | { readonly kind: "literal"; readonly value: string }
+  | { readonly kind: "backup-id" }
+  | { readonly kind: "migration-time" };
 
 export interface SchemaIssue {
   readonly code: SchemaIssueCode;
@@ -55,6 +72,31 @@ export type SchemaMigrationAction =
       readonly sheet: "_gq_meta" | "_gq_dead_letters";
     }
   | {
+      readonly kind: "add-dead-letter-actor-column";
+      readonly spreadsheetId: string;
+      readonly sheetId: number;
+      readonly columnIndex: number;
+      readonly gridColumnCount: number;
+    }
+  | {
+      readonly kind: "repair-system-sheet-cells";
+      readonly spreadsheetId: string;
+      readonly sheet: "_gq_meta" | "_gq_dead_letters";
+      readonly sheetId: number;
+      readonly gridColumnCount: number;
+      readonly cells: readonly {
+        readonly rowIndex: number;
+        readonly columnIndex: number;
+        readonly value: SystemCellRepairValue;
+      }[];
+    }
+  | {
+      readonly kind: "protect-system-sheet";
+      readonly spreadsheetId: string;
+      readonly sheet: "_gq_meta" | "_gq_dead_letters";
+      readonly sheetId: number;
+    }
+  | {
       readonly kind: "backfill-cell";
       readonly spreadsheetId: string;
       readonly table: string;
@@ -63,6 +105,16 @@ export type SchemaMigrationAction =
       readonly rowIndex: number;
       readonly columnIndex: number;
       readonly value: SheetCellInput;
+    }
+  | {
+      readonly kind: "repair-version-cell";
+      readonly spreadsheetId: string;
+      readonly table: string;
+      readonly sheet: string;
+      readonly sheetId: number;
+      readonly rowIndex: number;
+      readonly columnIndex: number;
+      readonly value: number;
     };
 
 export interface SchemaPlan {
@@ -112,10 +164,140 @@ export interface SchemaMigrationAdapter {
   ): void;
 }
 
+export interface SchemaCanonicalState {
+  isStrictCanonical(spreadsheetId: string): boolean;
+  setStrictCanonical(spreadsheetId: string, enabled: boolean): void;
+}
+
+export interface SchemaCanonicalModeAdapter {
+  apply(
+    spreadsheetId: string,
+    enabled: boolean,
+    context: { readonly changedAt: string },
+  ): void;
+}
+
+export interface SchemaCanonicalModeOptions {
+  readonly confirm: true;
+  readonly adapter?: SchemaCanonicalModeAdapter;
+}
+
+export interface SchemaCanonicalModeResult {
+  readonly status: "activated" | "rolled-back" | "no-op";
+  readonly strictCanonical: boolean;
+  readonly spreadsheets: readonly string[];
+  readonly plan?: SchemaPlan;
+}
+
+export interface SchemaCanonicalStatus {
+  readonly spreadsheetId: string;
+  readonly strictCanonical: boolean;
+}
+
+export class InMemorySchemaCanonicalState implements SchemaCanonicalState {
+  private readonly values = new Map<string, boolean>();
+
+  public isStrictCanonical(spreadsheetId: string): boolean {
+    return this.values.get(spreadsheetId) ?? false;
+  }
+
+  public setStrictCanonical(spreadsheetId: string, enabled: boolean): void {
+    this.values.set(spreadsheetId, enabled);
+  }
+}
+
+export function strictCanonicalPropertyKey(spreadsheetId: string): string {
+  return `gq2:strict-canonical:${spreadsheetId}`;
+}
+
+export interface AppsScriptSchemaCanonicalStateOptions {
+  /** Injectable mirror used by tests and non-default Apps Script runtimes. */
+  readonly properties?: PropertyStore;
+  /**
+   * Read the protected `_gq_meta` value. Undefined means the system sheet does
+   * not exist yet, so dual decoding remains enabled.
+   */
+  readonly readMeta?: (spreadsheetId: string) => boolean | undefined;
+}
+
+export class AppsScriptSchemaCanonicalState implements SchemaCanonicalState {
+  /** One authoritative system-sheet read per workbook and Apps Script execution. */
+  private readonly resolved = new Map<string, boolean>();
+
+  public constructor(
+    private readonly options: AppsScriptSchemaCanonicalStateOptions = {},
+  ) {}
+
+  public isStrictCanonical(spreadsheetId: string): boolean {
+    const resolved = this.resolved.get(spreadsheetId);
+    if (resolved !== undefined) return resolved;
+    const properties = this.properties();
+    const key = strictCanonicalPropertyKey(spreadsheetId);
+    const authoritative = this.options.readMeta === undefined
+      ? this.readMeta(spreadsheetId)
+      : this.options.readMeta(spreadsheetId);
+    if (authoritative === undefined) {
+      // A stale property must never activate strict mode before `_gq_meta`
+      // exists. Remove it so subsequent inspections cannot mistake it for the
+      // source of truth.
+      properties.remove(key);
+      this.resolved.set(spreadsheetId, false);
+      return false;
+    }
+    const encoded = String(authoritative);
+    if (properties.get(key) !== encoded) properties.set(key, encoded);
+    this.resolved.set(spreadsheetId, authoritative);
+    return authoritative;
+  }
+
+  public setStrictCanonical(spreadsheetId: string, enabled: boolean): void {
+    // SchemaManager persists `_gq_meta` through its mode adapter first. This is
+    // only a recoverable fast mirror; isStrictCanonical() always reconciles it
+    // back to the protected sheet.
+    this.properties().set(strictCanonicalPropertyKey(spreadsheetId), String(enabled));
+    this.resolved.set(spreadsheetId, enabled);
+  }
+
+  private properties(): PropertyStore {
+    return this.options.properties
+      ?? new AppsScriptPropertyStore(PropertiesService.getScriptProperties());
+  }
+
+  private readMeta(spreadsheetId: string): boolean | undefined {
+    if (typeof SpreadsheetApp === "undefined") {
+      throw new GQueryRuntimeError(
+        "UNSUPPORTED_OPERATION",
+        "SpreadsheetApp is required to read canonical migration mode.",
+      );
+    }
+    const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName("_gq_meta");
+    if (sheet === null) return undefined;
+    const lastRow = Math.max(1, sheet.getLastRow());
+    const values = sheet.getRange(1, 1, lastRow, 2).getDisplayValues();
+    const matches = values.filter((row) => row[0] === "strict_canonical");
+    if (matches.length !== 1 || (matches[0]?.[1] !== "true" && matches[0]?.[1] !== "false")) {
+      throw new GQueryRuntimeError(
+        "MIGRATION_REQUIRED",
+        "The protected _gq_meta sheet has invalid strict_canonical migration state.",
+        {
+          details: {
+            spreadsheetId,
+            values: matches.map((row) => row[1]),
+          },
+        },
+      );
+    }
+    return matches[0][1] === "true";
+  }
+}
+
 export interface SchemaManagementAccess {
   readonly definition: DatabaseDefinition;
   readonly transport: SheetsTransport;
+  readonly canonicalState?: SchemaCanonicalState;
   resolveSourceId(sourceName: string): string;
+  invalidateStructure?(spreadsheetId: string): void;
+  invalidateTable?(spreadsheetId: string, tableName: string): void;
 }
 
 interface LoadedTable {
@@ -133,7 +315,7 @@ interface DecodedTable {
 }
 
 function decodedBlank(value: SheetCellValue | undefined): unknown {
-  return value === undefined || value === null ? BLANK_CELL : value;
+  return value === undefined || value === null || value === "" ? BLANK_CELL : value;
 }
 
 function toSheetValue(value: EncodedCell): SheetCellInput {
@@ -147,16 +329,75 @@ function tableUsesFormula(definition: TableDefinition): boolean {
 }
 
 function key(row: Record<string, unknown>, fields: readonly string[]): string {
-  return JSON.stringify(fields.map((field) => row[field]));
+  return canonicalStringify(fields.map((field) => row[field]));
 }
 
 function relationFields(value: string | readonly string[]): readonly string[] {
   return typeof value === "string" ? [value] : value;
 }
 
+const META_HEADERS = Object.freeze(["Key", "Value"] as const);
+const META_REQUIRED_ROWS = Object.freeze([
+  { key: "schema_version", fallback: { kind: "literal", value: "2" } as const },
+  { key: "migrated_at", fallback: { kind: "migration-time" } as const },
+  { key: "backup_id", fallback: { kind: "backup-id" } as const },
+  { key: "strict_canonical", fallback: { kind: "literal", value: "false" } as const },
+  { key: "strict_canonical_changed_at", fallback: { kind: "migration-time" } as const },
+] as const);
+
+function physicalString(value: SheetCellValue | undefined): string {
+  return value === null || value === undefined ? "" : String(value);
+}
+
 /** Read-only audit plus explicit, backup-gated schema migration. */
 export class SchemaManager {
-  public constructor(private readonly access: SchemaManagementAccess) {}
+  private readonly canonicalState: SchemaCanonicalState;
+
+  public constructor(private readonly access: SchemaManagementAccess) {
+    this.canonicalState = access.canonicalState ?? new InMemorySchemaCanonicalState();
+  }
+
+  public strictCanonicalStatus(): readonly SchemaCanonicalStatus[] {
+    return Object.freeze(this.spreadsheetIds().map((spreadsheetId) => Object.freeze({
+      spreadsheetId,
+      strictCanonical: this.canonicalState.isStrictCanonical(spreadsheetId),
+    })));
+  }
+
+  /**
+   * Enable canonical-only decoding only after a fresh audit proves that no
+   * legacy cells, invalid cells, or unapplied migration actions remain.
+   */
+  public activateStrictCanonical(options: SchemaCanonicalModeOptions): SchemaCanonicalModeResult {
+    if (options.confirm !== true) {
+      throw new GQueryRuntimeError("MIGRATION_REQUIRED", "activateStrictCanonical() requires confirm: true.");
+    }
+    const plan = this.plan();
+    const errors = plan.issues.filter((issue) => issue.severity === "error");
+    if (errors.length > 0 || plan.invalidCells > 0 || plan.legacyCells > 0 || plan.actions.length > 0) {
+      throw new GQueryRuntimeError(
+        "MIGRATION_REQUIRED",
+        "Canonical-only decoding requires a clean post-backfill schema audit.",
+        {
+          details: {
+            errors,
+            invalidCells: plan.invalidCells,
+            legacyCells: plan.legacyCells,
+            pendingActions: plan.actions,
+          },
+        },
+      );
+    }
+    return this.setStrictCanonical(true, options.adapter, plan);
+  }
+
+  /** Disable canonical-only decoding as the documented rollback switch. */
+  public rollbackStrictCanonical(options: SchemaCanonicalModeOptions): SchemaCanonicalModeResult {
+    if (options.confirm !== true) {
+      throw new GQueryRuntimeError("MIGRATION_REQUIRED", "rollbackStrictCanonical() requires confirm: true.");
+    }
+    return this.setStrictCanonical(false, options.adapter);
+  }
 
   public plan(): SchemaPlan {
     const generatedAt = new Date().toISOString();
@@ -218,6 +459,47 @@ export class SchemaManager {
       }
       if (missingHeaders.length > 0) continue;
 
+      const dataColumnIndexes = Object.entries(table.definition.columns).map(([field, column]) => {
+        const index = byHeader.get(column.header ?? field);
+        if (index === undefined) {
+          throw new GQueryRuntimeError("MISSING_HEADER", `Required header ${column.header ?? field} is missing.`);
+        }
+        return index;
+      });
+      const versionIndex = table.definition.versionColumn === undefined
+        ? undefined
+        : byHeader.get(table.definition.versionColumn);
+      if (versionIndex !== undefined) {
+        for (let rowIndex = 1; rowIndex < table.values.length; rowIndex += 1) {
+          const physical = table.values[rowIndex] ?? [];
+          const populated = dataColumnIndexes.some((index) => {
+            const value = physical[index];
+            return value !== null && value !== undefined && value !== "";
+          });
+          if (!populated) continue;
+          const version = physical[versionIndex];
+          if (!Number.isSafeInteger(version) || (version as number) < 1) {
+            issues.push(this.issue(
+              table,
+              "INVALID_VERSION",
+              "warning",
+              `Populated row ${rowIndex + 1} requires a positive integer ${table.definition.versionColumn} value.`,
+              { row: rowIndex + 1, header: table.definition.versionColumn },
+            ));
+            actions.push({
+              kind: "repair-version-cell",
+              spreadsheetId: table.spreadsheetId,
+              table: table.tableName,
+              sheet: table.definition.sheet,
+              sheetId: table.sheet.sheetId,
+              rowIndex,
+              columnIndex: versionIndex,
+              value: 1,
+            });
+          }
+        }
+      }
+
       const rows: Record<string, unknown>[] = [];
       const keyTrackers = [
         ...(table.definition.primaryKey.length === 0
@@ -232,7 +514,10 @@ export class SchemaManager {
       ];
       for (let rowIndex = 1; rowIndex < table.values.length; rowIndex += 1) {
         const physical = table.values[rowIndex] ?? [];
-        if (physical.every((value) => value === null || value === undefined || value === "")) continue;
+        if (dataColumnIndexes.every((index) => {
+          const value = physical[index];
+          return value === null || value === undefined || value === "";
+        })) continue;
         const row: Record<string, unknown> = {};
         let rowValid = true;
         for (const [field, column] of Object.entries(table.definition.columns)) {
@@ -248,7 +533,12 @@ export class SchemaManager {
             });
             row[field] = value;
             try {
-              column.codec.decode(raw, { table: table.tableName, column: field, header, rowNumber: rowIndex + 1 });
+              column.decodeCanonical(raw, {
+                table: table.tableName,
+                column: field,
+                header,
+                rowNumber: rowIndex + 1,
+              });
               canonicalCells += 1;
             } catch {
               legacyCells += 1;
@@ -394,12 +684,55 @@ export class SchemaManager {
       }
       backups[spreadsheetId] = backupId;
       adapter.apply(spreadsheetId, workbookActions, { backupId, migratedAt: new Date().toISOString() });
+      this.access.invalidateStructure?.(spreadsheetId);
+      for (const tableName of new Set(workbookActions.flatMap((action) =>
+        "table" in action ? [action.table] : [],
+      ))) {
+        this.access.invalidateTable?.(spreadsheetId, tableName);
+      }
     }
     return {
       status: "migrated",
       backups: Object.freeze(backups),
       appliedActions: actions.length,
       plan,
+    };
+  }
+
+  private spreadsheetIds(): string[] {
+    return [...new Set(Object.values(this.access.definition.tables).map(
+      (definition) => this.access.resolveSourceId(definition.source),
+    ))].sort();
+  }
+
+  private setStrictCanonical(
+    enabled: boolean,
+    adapter: SchemaCanonicalModeAdapter | undefined,
+    plan?: SchemaPlan,
+  ): SchemaCanonicalModeResult {
+    const spreadsheetIds = this.spreadsheetIds();
+    const changed = spreadsheetIds.filter(
+      (spreadsheetId) => this.canonicalState.isStrictCanonical(spreadsheetId) !== enabled,
+    );
+    if (changed.length === 0) {
+      return {
+        status: "no-op",
+        strictCanonical: enabled,
+        spreadsheets: Object.freeze([]),
+        ...(plan === undefined ? {} : { plan }),
+      };
+    }
+    const modeAdapter = adapter ?? new AppsScriptSchemaCanonicalModeAdapter();
+    const changedAt = new Date().toISOString();
+    for (const spreadsheetId of changed) {
+      modeAdapter.apply(spreadsheetId, enabled, { changedAt });
+      this.canonicalState.setStrictCanonical(spreadsheetId, enabled);
+    }
+    return {
+      status: enabled ? "activated" : "rolled-back",
+      strictCanonical: enabled,
+      spreadsheets: Object.freeze(changed),
+      ...(plan === undefined ? {} : { plan }),
     };
   }
 
@@ -420,13 +753,22 @@ export class SchemaManager {
     }
     const loaded: LoadedTable[] = [];
     for (const [spreadsheetId, group] of grouped) {
-      for (const systemSheet of ["_gq_meta", "_gq_dead_letters"] as const) {
+      for (const systemSheet of GQUERY_SYSTEM_SHEET_NAMES) {
         if (!group.metadata.sheets.some((sheet) => sheet.title === systemSheet)) {
           actions.push({ kind: "create-system-sheet", spreadsheetId, sheet: systemSheet });
         }
       }
       const existing = group.entries.filter(([, definition]) => group.metadata.sheets.some((sheet) => sheet.title === definition.sheet));
-      const ranges = existing.map(([, definition]) => `'${definition.sheet.replace(/'/g, "''")}'`);
+      const systemSheets = group.metadata.sheets.filter(
+        (sheet) => GQUERY_SYSTEM_SHEET_NAMES.includes(sheet.title as typeof GQUERY_SYSTEM_SHEET_NAMES[number]),
+      );
+      const ranges = [
+        ...existing.map(([, definition]) => `'${definition.sheet.replace(/'/g, "''")}'`),
+        ...systemSheets.map((sheet) => sheet.title === "_gq_dead_letters"
+          ? "'_gq_dead_letters'!1:1"
+          : "'_gq_meta'",
+        ),
+      ];
       const response = ranges.length === 0
         ? { valueRanges: [] }
         : this.access.transport.batchGet(spreadsheetId, ranges, {
@@ -459,8 +801,130 @@ export class SchemaManager {
         });
         existingIndex += 1;
       }
+      for (let index = 0; index < systemSheets.length; index += 1) {
+        this.auditSystemSheet(
+          group.sourceName,
+          spreadsheetId,
+          systemSheets[index],
+          response.valueRanges[existing.length + index]?.values ?? [],
+          actions,
+          issues,
+        );
+      }
     }
     return loaded;
+  }
+
+  private auditSystemSheet(
+    sourceName: string,
+    spreadsheetId: string,
+    sheet: SheetMetadata,
+    values: readonly (readonly SheetCellValue[])[],
+    actions: SchemaMigrationAction[],
+    issues: SchemaIssue[],
+  ): void {
+    if (sheet.title !== "_gq_meta" && sheet.title !== "_gq_dead_letters") return;
+    const systemSheet = sheet.title;
+    const cells: Array<{
+      rowIndex: number;
+      columnIndex: number;
+      value: SystemCellRepairValue;
+    }> = [];
+    const headers = values[0] ?? [];
+
+    if (systemSheet === "_gq_meta") {
+      META_HEADERS.forEach((header, columnIndex) => {
+        if (physicalString(headers[columnIndex]) !== header) {
+          cells.push({ rowIndex: 0, columnIndex, value: { kind: "literal", value: header } });
+        }
+      });
+      const byKey = new Map<string, number>();
+      for (let rowIndex = 1; rowIndex < values.length; rowIndex += 1) {
+        const candidate = physicalString(values[rowIndex]?.[0]);
+        if (candidate !== "" && !byKey.has(candidate)) byKey.set(candidate, rowIndex);
+      }
+      let nextRow = Math.max(1, values.length);
+      for (const required of META_REQUIRED_ROWS) {
+        let rowIndex = byKey.get(required.key);
+        if (rowIndex === undefined) {
+          rowIndex = nextRow;
+          nextRow += 1;
+          cells.push({ rowIndex, columnIndex: 0, value: { kind: "literal", value: required.key } });
+          cells.push({ rowIndex, columnIndex: 1, value: required.fallback });
+          continue;
+        }
+        const current = physicalString(values[rowIndex]?.[1]);
+        const valid = required.key === "schema_version"
+          ? current === "2"
+          : required.key === "strict_canonical"
+            ? current === "true" || current === "false"
+            : current.trim().length > 0;
+        if (!valid) cells.push({ rowIndex, columnIndex: 1, value: required.fallback });
+      }
+    } else {
+      const expectedHeaders = [
+        ...DEFERRED_DEAD_LETTER_BASE_HEADERS,
+        DEFERRED_DEAD_LETTER_ACTOR_HEADER,
+      ];
+      const baseCanonical = DEFERRED_DEAD_LETTER_BASE_HEADERS.every(
+        (header, columnIndex) => physicalString(headers[columnIndex]) === header,
+      );
+      const actorPresent = headers.some(
+        (header) => physicalString(header) === DEFERRED_DEAD_LETTER_ACTOR_HEADER,
+      );
+      if (baseCanonical && !actorPresent) {
+        actions.push({
+          kind: "add-dead-letter-actor-column",
+          spreadsheetId,
+          sheetId: sheet.sheetId,
+          columnIndex: headers.length,
+          gridColumnCount: sheet.columnCount,
+        });
+      } else if (!baseCanonical) {
+        expectedHeaders.forEach((header, columnIndex) => {
+          if (physicalString(headers[columnIndex]) !== header) {
+            cells.push({ rowIndex: 0, columnIndex, value: { kind: "literal", value: header } });
+          }
+        });
+      }
+    }
+
+    if (cells.length > 0) {
+      issues.push({
+        code: "INVALID_SYSTEM_SHEET",
+        severity: "warning",
+        source: sourceName,
+        spreadsheetId,
+        table: systemSheet,
+        sheet: systemSheet,
+        message: `System sheet ${systemSheet} is incomplete and will be repaired by schema.migrate().`,
+      });
+      actions.push({
+        kind: "repair-system-sheet-cells",
+        spreadsheetId,
+        sheet: systemSheet,
+        sheetId: sheet.sheetId,
+        gridColumnCount: sheet.columnCount,
+        cells: Object.freeze(cells),
+      });
+    }
+    if (sheet.hasFullSheetProtection === false) {
+      issues.push({
+        code: "UNPROTECTED_SYSTEM_SHEET",
+        severity: "warning",
+        source: sourceName,
+        spreadsheetId,
+        table: systemSheet,
+        sheet: systemSheet,
+        message: `System sheet ${systemSheet} is not fully protected.`,
+      });
+      actions.push({
+        kind: "protect-system-sheet",
+        spreadsheetId,
+        sheet: systemSheet,
+        sheetId: sheet.sheetId,
+      });
+    }
   }
 
   private issue(
@@ -483,9 +947,55 @@ export class SchemaManager {
   }
 }
 
-function requestBytes(request: unknown): number {
-  return JSON.stringify(request).length;
+/** Persist the canonical-mode switch in the protected `_gq_meta` sheet. */
+export class AppsScriptSchemaCanonicalModeAdapter implements SchemaCanonicalModeAdapter {
+  public apply(spreadsheetId: string, enabled: boolean, context: { readonly changedAt: string }): void {
+    if (typeof SpreadsheetApp === "undefined") {
+      throw new GQueryRuntimeError("UNSUPPORTED_OPERATION", "SpreadsheetApp is required to change canonical migration mode.");
+    }
+    const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName("_gq_meta");
+    if (sheet === null) {
+      throw new GQueryRuntimeError("MIGRATION_REQUIRED", "The protected _gq_meta sheet must exist before changing canonical migration mode.");
+    }
+    const lastRow = Math.max(1, sheet.getLastRow());
+    const values = sheet.getRange(1, 1, lastRow, 2).getDisplayValues();
+    const strictIndex = values.findIndex((row) => row[0] === "strict_canonical");
+    if (strictIndex < 0) {
+      throw new GQueryRuntimeError("MIGRATION_REQUIRED", "_gq_meta is missing the strict_canonical migration state row.");
+    }
+    sheet.getRange(strictIndex + 1, 2).setValue(String(enabled));
+    const changedIndex = values.findIndex((row) => row[0] === "strict_canonical_changed_at");
+    if (changedIndex >= 0) sheet.getRange(changedIndex + 1, 2).setValue(context.changedAt);
+    else sheet.appendRow(["strict_canonical_changed_at", context.changedAt]);
+  }
 }
+
+function utf8Bytes(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit < 0x80) bytes += 1;
+    else if (codeUnit < 0x800) bytes += 2;
+    else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function requestBytes(request: unknown): number {
+  return utf8Bytes(JSON.stringify(request));
+}
+
+const MAX_VERSION_ROWS_PER_REQUEST = 10_000;
 
 /** Default Apps Script migration adapter. It is used only by explicit migrate(). */
 export class AppsScriptSchemaMigrationAdapter implements SchemaMigrationAdapter {
@@ -531,32 +1041,88 @@ export class AppsScriptSchemaMigrationAdapter implements SchemaMigrationAdapter 
           else contiguous.push({ start: rowIndex, end: rowIndex + 1 });
         }
         for (const span of contiguous) {
-          requests.push({
-            updateCells: {
-              range: {
-                sheetId: action.sheetId,
-                startRowIndex: span.start,
-                startColumnIndex: action.columnIndex,
+          for (let start = span.start; start < span.end; start += MAX_VERSION_ROWS_PER_REQUEST) {
+            const end = Math.min(span.end, start + MAX_VERSION_ROWS_PER_REQUEST);
+            requests.push({
+              updateCells: {
+                range: {
+                  sheetId: action.sheetId,
+                  startRowIndex: start,
+                  startColumnIndex: action.columnIndex,
+                },
+                rows: Array.from(
+                  { length: end - start },
+                  () => ({ values: [{ userEnteredValue: { numberValue: 1 } }] }),
+                ),
+                fields: "userEnteredValue",
               },
-              rows: Array.from(
-                { length: span.end - span.start },
-                () => ({ values: [{ userEnteredValue: { numberValue: 1 } }] }),
-              ),
-              fields: "userEnteredValue",
-            },
-          });
+            });
+          }
         }
         requests.push({ updateDimensionProperties: {
           range: { sheetId: action.sheetId, dimension: "COLUMNS", startIndex: action.columnIndex, endIndex: action.columnIndex + 1 },
           properties: { hiddenByUser: true },
           fields: "hiddenByUser",
         } });
-      } else if (action.kind === "backfill-cell") {
+      } else if (action.kind === "backfill-cell" || action.kind === "repair-version-cell") {
         const userEnteredValue = encodeAtomicExtendedValue(action.value);
         requests.push({ updateCells: {
           range: { sheetId: action.sheetId, startRowIndex: action.rowIndex, startColumnIndex: action.columnIndex },
           rows: [{ values: [userEnteredValue === undefined ? {} : { userEnteredValue }] }],
           fields: "userEnteredValue",
+        } });
+      } else if (action.kind === "add-dead-letter-actor-column") {
+        if (action.columnIndex >= action.gridColumnCount) {
+          requests.push({ appendDimension: {
+            sheetId: action.sheetId,
+            dimension: "COLUMNS",
+            length: action.columnIndex - action.gridColumnCount + 1,
+          } });
+        }
+        requests.push({ updateCells: {
+          range: {
+            sheetId: action.sheetId,
+            startRowIndex: 0,
+            startColumnIndex: action.columnIndex,
+          },
+          rows: [{ values: [{ userEnteredValue: { stringValue: DEFERRED_DEAD_LETTER_ACTOR_HEADER } }] }],
+          fields: "userEnteredValue",
+        } });
+      } else if (action.kind === "repair-system-sheet-cells") {
+        const requiredColumns = action.cells.reduce(
+          (maximum, cell) => Math.max(maximum, cell.columnIndex + 1),
+          0,
+        );
+        if (requiredColumns > action.gridColumnCount) {
+          requests.push({ appendDimension: {
+            sheetId: action.sheetId,
+            dimension: "COLUMNS",
+            length: requiredColumns - action.gridColumnCount,
+          } });
+        }
+        for (const cell of action.cells) {
+          const value = cell.value.kind === "literal"
+            ? cell.value.value
+            : cell.value.kind === "backup-id"
+              ? context.backupId
+              : context.migratedAt;
+          requests.push({ updateCells: {
+            range: {
+              sheetId: action.sheetId,
+              startRowIndex: cell.rowIndex,
+              startColumnIndex: cell.columnIndex,
+            },
+            rows: [{ values: [{ userEnteredValue: { stringValue: value } }] }],
+            fields: "userEnteredValue",
+          } });
+        }
+      } else if (action.kind === "protect-system-sheet") {
+        requests.push({ addProtectedRange: {
+          protectedRange: {
+            range: { sheetId: action.sheetId },
+            description: "Managed by GQuery 2.0",
+            warningOnly: false,
+          },
         } });
       } else {
         while (usedIds.has(nextSystemId)) nextSystemId -= 1;
@@ -570,8 +1136,9 @@ export class AppsScriptSchemaMigrationAdapter implements SchemaMigrationAdapter 
               ["migrated_at", context.migratedAt],
               ["backup_id", context.backupId],
               ["strict_canonical", "false"],
+              ["strict_canonical_changed_at", context.migratedAt],
             ]
-          : [["ID", "Mutation ID", "Source", "Table", "Key", "Conflict", "Moved At"]];
+          : [[...DEFERRED_DEAD_LETTER_BASE_HEADERS, DEFERRED_DEAD_LETTER_ACTOR_HEADER]];
         requests.push({ addSheet: { properties: { sheetId, title: action.sheet, hidden: true } } });
         requests.push({ updateCells: {
           range: { sheetId, startRowIndex: 0, startColumnIndex: 0 },

@@ -16,6 +16,8 @@ export type FieldOperators<V> = {
     $startsWith?: V extends string ? string : never;
     $endsWith?: V extends string ? string : never;
     $isBlank?: boolean;
+    /** Matches decoded logical null only; unlike $isBlank it does not match "" or undefined. */
+    $isNull?: boolean;
 };
 export type Where<T extends Record<string, unknown>> = {
     [K in keyof T]?: T[K] | FieldOperators<T[K]>;
@@ -24,7 +26,7 @@ export type Where<T extends Record<string, unknown>> = {
     $or?: readonly Where<T>[];
     $not?: Where<T>;
 };
-export type PredicateOperator = "eq" | "ne" | "in" | "notIn" | "gt" | "gte" | "lt" | "lte" | "between" | "contains" | "startsWith" | "endsWith" | "isBlank";
+export type PredicateOperator = "eq" | "ne" | "in" | "notIn" | "gt" | "gte" | "lt" | "lte" | "between" | "contains" | "startsWith" | "endsWith" | "isBlank" | "isNull";
 export type PredicateNode = {
     kind: "field";
     field: string;

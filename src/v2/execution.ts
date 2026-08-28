@@ -57,6 +57,8 @@ export interface ExecutionStats {
   elapsedMs: number;
   lockWaitMs: number;
   fullScans: number;
+  /** Additional related rows beyond one match per base row. */
+  joinFanOut: number;
   rangesRead: string[];
   rangesWritten: string[];
 }
@@ -77,6 +79,7 @@ export function createExecutionStats(
     elapsedMs: initial.elapsedMs ?? 0,
     lockWaitMs: initial.lockWaitMs ?? 0,
     fullScans: initial.fullScans ?? 0,
+    joinFanOut: initial.joinFanOut ?? 0,
     rangesRead: [...(initial.rangesRead ?? [])],
     rangesWritten: [...(initial.rangesWritten ?? [])],
   };
@@ -99,6 +102,7 @@ export function mergeExecutionStats(
     merged.elapsedMs += item.elapsedMs;
     merged.lockWaitMs += item.lockWaitMs;
     merged.fullScans += item.fullScans;
+    merged.joinFanOut += item.joinFanOut;
     merged.rangesRead.push(...item.rangesRead);
     merged.rangesWritten.push(...item.rangesWritten);
   }

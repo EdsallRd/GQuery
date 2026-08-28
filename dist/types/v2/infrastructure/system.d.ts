@@ -9,11 +9,15 @@ export interface ManagedTriggerSpec {
 }
 export interface InstalledTrigger extends ManagedTriggerSpec {
     readonly id: string;
+    /** True only when this reconciliation namespace durably owns the trigger ID. */
+    readonly managed?: boolean;
 }
 export interface TriggerPlatform {
     list(): readonly InstalledTrigger[];
     create(spec: ManagedTriggerSpec): InstalledTrigger;
     remove(id: string): void;
+    /** Persist ownership when an exact pre-existing trigger is adopted. */
+    manage?(trigger: InstalledTrigger): InstalledTrigger;
 }
 export interface TriggerConfiguration {
     readonly spreadsheetId: string;
@@ -29,7 +33,7 @@ export interface TriggerReconciliationResult {
     readonly kept: readonly InstalledTrigger[];
     readonly removed: readonly InstalledTrigger[];
 }
-/** Reconciles only handlers named by the configuration and leaves unrelated project triggers alone. */
+/** Reconciles durably owned trigger IDs and leaves unrelated project triggers alone. */
 export declare class TriggerReconciler {
     private readonly platform;
     constructor(platform: TriggerPlatform);
@@ -42,6 +46,7 @@ export declare class AppsScriptTriggerPlatform implements TriggerPlatform {
     constructor(properties: PropertyStore, metadataNamespace?: string);
     list(): readonly InstalledTrigger[];
     create(spec: ManagedTriggerSpec): InstalledTrigger;
+    manage(trigger: InstalledTrigger): InstalledTrigger;
     remove(id: string): void;
     private metadataKey;
     private readMetadata;

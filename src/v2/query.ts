@@ -18,6 +18,8 @@ export type FieldOperators<V> = {
   $startsWith?: V extends string ? string : never;
   $endsWith?: V extends string ? string : never;
   $isBlank?: boolean;
+  /** Matches decoded logical null only; unlike $isBlank it does not match "" or undefined. */
+  $isNull?: boolean;
 };
 
 export type Where<T extends Record<string, unknown>> = {
@@ -41,7 +43,8 @@ export type PredicateOperator =
   | "contains"
   | "startsWith"
   | "endsWith"
-  | "isBlank";
+  | "isBlank"
+  | "isNull";
 
 export type PredicateNode =
   | { kind: "field"; field: string; operator: PredicateOperator; value?: unknown }
@@ -92,6 +95,7 @@ const OPERATOR_MAP: Record<string, PredicateOperator> = {
   $startsWith: "startsWith",
   $endsWith: "endsWith",
   $isBlank: "isBlank",
+  $isNull: "isNull",
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -185,8 +189,8 @@ export function normalizeWhere<T extends Record<string, unknown>>(where: Where<T
       if (operator === "between" && (!Array.isArray(value) || value.length !== 2)) {
         throw new TypeError("$between expects a two-item tuple.");
       }
-      if (operator === "isBlank" && typeof value !== "boolean") {
-        throw new TypeError("$isBlank expects a boolean.");
+      if ((operator === "isBlank" || operator === "isNull") && typeof value !== "boolean") {
+        throw new TypeError(`${rawOperator} expects a boolean.`);
       }
       nodes.push(Object.freeze({
         kind: "field",
@@ -249,6 +253,7 @@ export function evaluatePredicate(node: PredicateNode, row: Record<string, unkno
       const blank = actual === "" || actual === null || actual === undefined;
       return expected ? blank : !blank;
     }
+    case "isNull": return expected ? actual === null : actual !== null;
   }
   return false;
 }

@@ -110,6 +110,20 @@ describe("InMemorySheetsTransport", () => {
     expect(memory.snapshot("book")).toEqual(before);
   });
 
+  it("enforces the same atomic payload safety ceiling without mutating memory", () => {
+    const memory = transport();
+    const before = memory.snapshot("book");
+    expect(() => memory.atomicBatchUpdate("book", [{
+      kind: "updateCells",
+      sheetId: 7,
+      startRowIndex: 1,
+      startColumnIndex: 0,
+      values: [["x".repeat(1_800_000)]],
+    }])).toThrow(expect.objectContaining({ code: "REQUEST_TOO_LARGE" }));
+    expect(memory.snapshot("book")).toEqual(before);
+    expect(memory.history.filter((call) => call.kind === "atomicBatchUpdate")).toHaveLength(0);
+  });
+
   it("returns IDs and current extents as metadata", () => {
     expect(transport().getSpreadsheetMetadata("book").sheets[0]).toEqual({
       sheetId: 7,

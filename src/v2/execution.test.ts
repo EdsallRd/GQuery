@@ -6,11 +6,13 @@ describe("execution statistics", () => {
     const first = createExecutionStats({
       apiCalls: 1,
       cellsRead: 10,
+      joinFanOut: 2,
       rangesRead: ["'Assets'!A:A"],
     });
     const second = createExecutionStats({
       apiCalls: 1,
       cellsWritten: 2,
+      joinFanOut: 3,
       rangesWritten: ["'Assets'!B2:B3"],
     });
 
@@ -18,6 +20,7 @@ describe("execution statistics", () => {
       apiCalls: 2,
       cellsRead: 10,
       cellsWritten: 2,
+      joinFanOut: 5,
       rangesRead: ["'Assets'!A:A"],
       rangesWritten: ["'Assets'!B2:B3"],
     });

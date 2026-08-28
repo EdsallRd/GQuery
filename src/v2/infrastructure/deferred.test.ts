@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import { Fnv1aHash } from "./canonical";
 import {
   AppliedMutationReceiptLedger,
+  AppliedReceiptCapacityError,
   DeferredDeadLetter,
   DeferredJournal,
   DeferredMutationOutcome,
   IdempotencyConflictError,
   JournalCapacityError,
-  JournalLockTimeoutError,
+  JournalFlushLeaseLostError,
 } from "./deferred";
 import { PropertyStore, SyncLock } from "./runtime";
 
@@ -122,8 +123,117 @@ describe("DeferredJournal", () => {
     expect(journal.receipt(two.receipt.idempotencyKey)?.status).toBe("committed");
   });
 
-  it("moves conflicts to an idempotent dead-letter sink and retains transient failures", () => {
+  it("coalesces compatible patches across an interleaved independent key", () => {
     const { journal } = fixture();
+    journal.enqueue(patch("A-first", { status: "Repair" }));
+    journal.enqueue({
+      ...patch("B", { status: "Available" }),
+      key: { serial: "0002" },
+    });
+    journal.enqueue(patch("A-last", { notes: "checked" }));
+
+    const result = journal.flush({
+      apply: (mutations) => {
+        expect(mutations).toHaveLength(2);
+        expect(mutations[0]).toMatchObject({
+          key: { serial: "0001" },
+          values: { status: "Repair", notes: "checked" },
+          sourceMutationIds: expect.arrayContaining([
+            expect.any(String),
+            expect.any(String),
+          ]),
+        });
+        expect(mutations[1]).toMatchObject({ key: { serial: "0002" } });
+        return mutations.map((mutation) => ({
+          mutationId: mutation.id,
+          status: "committed" as const,
+        }));
+      },
+    }, { write: () => undefined });
+
+    expect(result).toMatchObject({ attempted: 3, committed: 3, coalesced: 1 });
+  });
+
+  it("flushes at most one incompatible actor/version chain per key", () => {
+    const { journal } = fixture();
+    journal.enqueue(patch("actor-a-v2", { status: "Repair" }));
+    journal.enqueue({
+      ...patch("actor-b-v2", { notes: "second" }),
+      actor: "other@example.com",
+    });
+    journal.enqueue({
+      ...patch("actor-b-v3", { notes: "third" }),
+      actor: "other@example.com",
+      expectedVersion: 3,
+    });
+    const applied: string[][] = [];
+    const executor = {
+      apply: (mutations: readonly { readonly sourceMutationIds: readonly string[]; readonly id: string }[]) => {
+        applied.push(mutations.flatMap((mutation) => mutation.sourceMutationIds));
+        return mutations.map((mutation) => ({
+          mutationId: mutation.id,
+          status: "committed" as const,
+        }));
+      },
+    };
+    const deadLetters = { write: () => undefined };
+
+    expect(journal.flush(executor, deadLetters)).toMatchObject({
+      attempted: 1,
+      committed: 1,
+      retained: 2,
+    });
+    expect(journal.flush(executor, deadLetters)).toMatchObject({
+      attempted: 1,
+      committed: 1,
+      retained: 1,
+    });
+    expect(journal.flush(executor, deadLetters)).toMatchObject({
+      attempted: 1,
+      committed: 1,
+      retained: 0,
+    });
+    expect(applied).toHaveLength(3);
+    expect(applied.every((group) => group.length === 1)).toBe(true);
+    expect(journal.receipt("actor-a-v2")?.status).toBe("committed");
+    expect(journal.receipt("actor-b-v2")?.status).toBe("committed");
+    expect(journal.receipt("actor-b-v3")?.status).toBe("committed");
+  });
+
+  it("coalesces a same-version patch followed by delete into the final delete", () => {
+    const { journal } = fixture();
+    const patched = journal.enqueue(patch("patch-first", { status: "Repair" }));
+    const deleted = journal.enqueue({
+      sourceId: "book",
+      table: "Assets",
+      kind: "delete",
+      key: { serial: "0001" },
+      expectedVersion: 2,
+      actor: "user@example.com",
+      idempotencyKey: "delete-last",
+    });
+    let appliedKind = "";
+    const result = journal.flush(
+      {
+        apply: (mutations) => {
+          expect(mutations).toHaveLength(1);
+          appliedKind = mutations[0].kind;
+          expect(mutations[0].values).toBeUndefined();
+          expect(mutations[0].expectedVersion).toBe(2);
+          return [{ mutationId: mutations[0].id, status: "committed" }];
+        },
+      },
+      { write: () => undefined },
+    );
+
+    expect(appliedKind).toBe("delete");
+    expect(result).toMatchObject({ attempted: 2, committed: 2, coalesced: 1, retained: 0 });
+    expect(journal.receipt(patched.receipt.idempotencyKey)?.status).toBe("committed");
+    expect(journal.receipt(deleted.receipt.idempotencyKey)?.status).toBe("committed");
+  });
+
+  it("moves conflicts outside the lock and retains transient failures", () => {
+    const { journal, lock } = fixture();
     journal.enqueue(patch("conflict", { status: "Repair" }));
     journal.enqueue({
       ...patch("transient", { status: "Assigned" }),
@@ -137,7 +247,12 @@ describe("DeferredJournal", () => {
           { mutationId: mutations[1].id, status: "transient", message: "quota" },
         ],
       },
-      { write: (records) => dead.push(...records) },
+      {
+        write: (records) => {
+          expect(lock.held).toBe(false);
+          dead.push(...records);
+        },
+      },
     );
 
     expect(result).toMatchObject({ conflicted: 1, committed: 0, retained: 1 });
@@ -146,8 +261,8 @@ describe("DeferredJournal", () => {
     expect(journal.list()[0]).toMatchObject({ attempts: 1, lastError: "quota" });
   });
 
-  it("holds one lock across remote application so overlapping flushes cannot reuse a snapshot", () => {
-    const { journal } = fixture({ lockTimeoutMs: 1 });
+  it("releases the lock for remote application and fences overlapping flushes with a durable lease", () => {
+    const { journal, lock } = fixture({ lockTimeoutMs: 1 });
     journal.enqueue(patch("request-1", { status: "Available" }));
     let applied = 0;
     let nestedApplied = 0;
@@ -155,13 +270,15 @@ describe("DeferredJournal", () => {
 
     const first = journal.flush({
       apply: (mutations) => {
+        expect(lock.held).toBe(false);
         applied += mutations.length;
-        expect(() => journal.flush({
+        const nested = journal.flush({
           apply: (nested) => {
             nestedApplied += nested.length;
             return nested.map((mutation) => ({ mutationId: mutation.id, status: "committed" as const }));
           },
-        }, deadLetters)).toThrow(JournalLockTimeoutError);
+        }, deadLetters);
+        expect(nested).toMatchObject({ attempted: 0, retained: 1, errors: [] });
         return mutations.map((mutation) => ({ mutationId: mutation.id, status: "committed" as const }));
       },
     }, deadLetters);
@@ -179,13 +296,85 @@ describe("DeferredJournal", () => {
     expect(applied).toBe(1);
   });
 
+  it("preserves entries concurrently enqueued while a leased snapshot is applied", () => {
+    const { journal, lock } = fixture();
+    journal.enqueue(patch("snapshot-entry", { status: "Available" }));
+
+    const result = journal.flush({
+      apply: (mutations) => {
+        expect(lock.held).toBe(false);
+        journal.enqueue({
+          ...patch("concurrent-entry", { status: "Repair" }),
+          key: { serial: "0002" },
+        });
+        return mutations.map((mutation) => ({ mutationId: mutation.id, status: "committed" as const }));
+      },
+    }, { write: () => undefined });
+
+    expect(result).toMatchObject({ attempted: 1, committed: 1, retained: 1 });
+    expect(journal.receipt("snapshot-entry")?.status).toBe("committed");
+    expect(journal.receipt("concurrent-entry")?.status).toBe("queued");
+    expect(journal.list()).toMatchObject([{ key: { serial: "0002" } }]);
+  });
+
+  it("allows an expired lease to be recovered and rejects stale reconciliation", () => {
+    const properties = new MemoryProperties();
+    const lock = new MemoryLock();
+    const hasher = new Fnv1aHash();
+    let id = 0;
+    let now = 100;
+    const dependencies = {
+      properties,
+      lock,
+      hasher,
+      ids: { next: () => `lease-${++id}` },
+      clock: { now: () => now },
+    };
+    const first = new DeferredJournal(dependencies, { flushLeaseMs: 10 });
+    const recovery = new DeferredJournal(dependencies, { flushLeaseMs: 10 });
+    first.enqueue(patch("expired-lease", { status: "Available" }));
+    let recoveryApplications = 0;
+
+    expect(() => first.flush({
+      apply: (mutations) => {
+        now = 111;
+        const recovered = recovery.flush({
+          apply: (recoveredMutations) => {
+            recoveryApplications += recoveredMutations.length;
+            return recoveredMutations.map((mutation) => ({
+              mutationId: mutation.id,
+              status: "committed" as const,
+            }));
+          },
+        }, { write: () => undefined });
+        expect(recovered).toMatchObject({ attempted: 1, committed: 1, retained: 0 });
+        return mutations.map((mutation) => ({ mutationId: mutation.id, status: "committed" as const }));
+      },
+    }, { write: () => undefined })).toThrow(JournalFlushLeaseLostError);
+
+    expect(recoveryApplications).toBe(1);
+    expect(first.list()).toHaveLength(0);
+    expect(first.receipt("expired-lease")?.status).toBe("committed");
+  });
+
+  it("can rebuild the cache overlay without recursively acquiring the journal lock", () => {
+    const { journal, lock } = fixture({ lockTimeoutMs: 1 });
+    journal.enqueue(patch("request-1", { status: "Available" }));
+    expect(lock.tryAcquire()).toBe(true);
+    try {
+      expect(journal.readAndRebuildOverlay()).toHaveLength(1);
+    } finally {
+      lock.release();
+    }
+  });
+
   it("stores applied receipts in one bounded, age-pruned ledger", () => {
     const properties = new MemoryProperties();
     let now = 1;
     const ledger = new AppliedMutationReceiptLedger(properties, {
       namespace: "test",
-      retainedReceiptLimit: 2,
-      maximumBytes: 256,
+      retainedReceiptLimit: 3,
+      maximumBytes: 8_000,
       maximumAgeMs: 10,
       clock: { now: () => now },
     });
@@ -196,18 +385,36 @@ describe("DeferredJournal", () => {
     now = 3;
     ledger.mark("mutation-3");
     expect(ledger.list().map((receipt) => receipt.mutationId)).toEqual([
+      "mutation-1",
       "mutation-2",
       "mutation-3",
     ]);
     expect([...properties.values.keys()]).toEqual(["test:deferred-applied"]);
-    expect(ledger.has("mutation-1")).toBe(false);
+    expect(ledger.has("mutation-1")).toBe(true);
     expect(ledger.has("mutation-3")).toBe(true);
 
     ledger.forget(["mutation-2"]);
-    expect(ledger.list().map((receipt) => receipt.mutationId)).toEqual(["mutation-3"]);
+    expect(ledger.list().map((receipt) => receipt.mutationId)).toEqual([
+      "mutation-1",
+      "mutation-3",
+    ]);
     now = 20;
-    expect(ledger.prune()).toBe(1);
+    expect(ledger.prune()).toBe(2);
     expect(properties.get("test:deferred-applied")).toBeNull();
+  });
+
+  it("refuses an unsafe applied checkpoint before it can truncate current sources", () => {
+    const properties = new MemoryProperties();
+    const ledger = new AppliedMutationReceiptLedger(properties, {
+      namespace: "bounded",
+      retainedReceiptLimit: 2,
+      maximumBytes: 8_000,
+      clock: { now: () => 1 },
+    });
+
+    expect(() => ledger.assertCanMarkMany(["one", "two", "three"]))
+      .toThrow(AppliedReceiptCapacityError);
+    expect(properties.get("bounded:deferred-applied")).toBeNull();
   });
 
   it("uses the applied ledger to recover without replay after journal cleanup publication fails", () => {
@@ -226,19 +433,25 @@ describe("DeferredJournal", () => {
       clock: { now: () => 100 },
     });
     let remoteApplications = 0;
+    let failCleanup = true;
     const executor = {
-      apply: (mutations: readonly { readonly id: string }[]) => mutations.map((mutation) => {
-        if (!ledger.has(mutation.id)) {
-          remoteApplications += 1;
-          ledger.mark(mutation.id);
+      apply: (mutations: readonly { readonly id: string }[]) => {
+        const outcomes = mutations.map((mutation) => {
+          if (!ledger.has(mutation.id)) {
+            remoteApplications += 1;
+            ledger.mark(mutation.id);
+          }
+          return { mutationId: mutation.id, status: "committed" as const };
+        });
+        if (failCleanup) {
+          failCleanup = false;
+          properties.failNextManifestPublication = true;
         }
-        return { mutationId: mutation.id, status: "committed" as const };
-      }),
+        return outcomes;
+      },
       forgetApplied: (mutationIds: readonly string[]) => ledger.forget(mutationIds),
     };
     journal.enqueue(patch("recover-once", { status: "Available" }));
-    properties.failNextManifestPublication = true;
-
     expect(() => journal.flush(executor, { write: () => undefined })).toThrow(
       "simulated manifest publication failure",
     );

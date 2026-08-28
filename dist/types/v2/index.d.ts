@@ -9,6 +9,7 @@ export * from "./provenance";
 export * from "./selection";
 export * from "./executor";
 export * from "./database";
+export * from "./cache-manager";
 export * from "./management";
 export * from "./system-manager";
 export * from "./deferred-manager";

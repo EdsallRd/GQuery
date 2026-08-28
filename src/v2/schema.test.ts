@@ -145,6 +145,69 @@ describe("v2 schema definitions", () => {
     ).toThrowError(/collides/i);
   });
 
+  it("rejects version-column collisions with physical headers and logical properties", () => {
+    expect(() =>
+      table({
+        source: "main",
+        sheet: "Physical Collision",
+        versionColumn: "Revision",
+        columns: {
+          id: text({ header: "ID" }),
+          userRevision: text({ header: "Revision" }),
+        },
+      }),
+    ).toThrowError(expect.objectContaining({
+      code: "DEFINITION_INVALID",
+      details: expect.objectContaining({ collision: "physical-header" }),
+    }));
+
+    expect(() =>
+      table({
+        source: "main",
+        sheet: "Logical Collision",
+        versionColumn: "revision",
+        columns: {
+          id: text({ header: "ID" }),
+          revision: text({ header: "User Revision" }),
+        },
+      }),
+    ).toThrowError(expect.objectContaining({
+      code: "DEFINITION_INVALID",
+      details: expect.objectContaining({ collision: "logical-property" }),
+    }));
+  });
+
+  it("rejects reserved system sheets and direct table-handle names", () => {
+    expect(() =>
+      table({
+        source: "main",
+        sheet: "_GQ_META",
+        columns: { id: text() },
+      }),
+    ).toThrowError(/reserved/i);
+
+    const Reserved = table({
+      source: "main",
+      sheet: "Ordinary Sheet",
+      columns: { id: text() },
+    });
+    expect(() =>
+      defineDatabase({
+        version: 2,
+        sources: { main: source.activeSpreadsheet() },
+        tables: { appendRows: Reserved },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "DEFINITION_INVALID" }));
+
+    expect(() =>
+      defineDatabase({
+        version: 2,
+        sources: { main: source.activeSpreadsheet() },
+        tables: { _gq_dead_letters: Reserved },
+      }),
+    ).toThrowError(/reserved/i);
+  });
+
   it("rejects invalid sources, targets, and foreign fields", () => {
     const Users = table({
       source: "main",

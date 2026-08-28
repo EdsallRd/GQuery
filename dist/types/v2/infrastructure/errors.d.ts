@@ -1,9 +1,12 @@
-export type GQueryErrorCode = "API_RATE_LIMIT" | "API_SERVER" | "API_NETWORK" | "API_DEADLINE" | "API_FAILURE" | "DEADLINE_EXCEEDED" | "RETRY_EXHAUSTED" | "AMBIGUOUS_COMMIT" | "CACHE_CORRUPT" | "CACHE_CONFIGURATION" | "JOURNAL_CAPACITY" | "JOURNAL_ENTRY_TOO_LARGE" | "JOURNAL_CORRUPT" | "JOURNAL_LOCK_TIMEOUT" | "DEFERRED_CONFLICT";
+export type GQueryErrorCode = "API_RATE_LIMIT" | "API_SERVER" | "API_NETWORK" | "API_DEADLINE" | "API_FAILURE" | "DEADLINE_EXCEEDED" | "RETRY_EXHAUSTED" | "AMBIGUOUS_COMMIT" | "CACHE_CORRUPT" | "CACHE_CONFIGURATION" | "JOURNAL_CAPACITY" | "JOURNAL_ENTRY_TOO_LARGE" | "JOURNAL_CORRUPT" | "JOURNAL_LOCK_TIMEOUT" | "DEFERRED_CONFLICT" | "REQUEST_TOO_LARGE";
 export declare class GQueryV2Error extends Error {
     readonly code: GQueryErrorCode;
     readonly details: Readonly<Record<string, unknown>>;
     readonly cause?: unknown;
     constructor(code: GQueryErrorCode, message: string, details?: Readonly<Record<string, unknown>>, cause?: unknown);
+}
+export declare class RequestPayloadTooLargeError extends GQueryV2Error {
+    constructor(operationKind: string, bytes: number, maximumBytes: number);
 }
 export type ApiFailureKind = "rate-limit" | "server" | "network" | "deadline" | "non-retryable";
 export interface ApiFailureDetails {
