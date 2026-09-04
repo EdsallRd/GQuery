@@ -131,6 +131,13 @@ export function batchUpdateValuesInternal(
     majorDimension: range.majorDimension,
     values: valuesMatrix(range.values),
   }));
+  if (data.every(({ values }) => values.every((row) => row.length === 0))) {
+    return {
+      spreadsheetId: client.spreadsheetId,
+      totalUpdatedRows: 0, totalUpdatedColumns: 0, totalUpdatedCells: 0, totalUpdatedSheets: 0,
+      responses: ranges.map(({ range }) => normalizedUpdate(undefined, client.spreadsheetId, range)),
+    };
+  }
   const response = callHandler(
     () =>
       Sheets!.Spreadsheets!.Values!.batchUpdate(

@@ -1,8 +1,11 @@
 import { type CacheOptions } from "./cache";
 import { GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryGetValuesOptions, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueRangeInput, GQueryValueRangeResult, GQueryWriteValuesOptions, InferSchema, StandardSchemaV1 } from "./types";
 export type { CacheOptions };
+export { configureGQueryWriteObserver } from "./cache";
 export * from "./types";
 export * from "./a1";
+export { configureGQueryObserver } from "./ratelimit";
+export type { GQueryMeasurement } from "./ratelimit";
 /**
  * Main GQuery class for interacting with Google Sheets
  * Provides a query-like interface for reading and writing spreadsheet data
@@ -10,11 +13,17 @@ export * from "./a1";
 export declare class GQuery {
     spreadsheetId: string;
     readonly retries: number;
+    private readonly handles;
     /**
      * Create a new GQuery instance
      * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
      */
     constructor(spreadsheetId?: string, options?: GQueryOptions);
+    /** @internal Reuse service handles within this instance; table data stays fresh. */
+    resolveTable(spreadsheetId: string, sheetName: string): {
+        spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+        sheet: GoogleAppsScript.Spreadsheet.Sheet;
+    };
     /** Read one targeted A1 range without loading an entire sheet. */
     getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
     /** Update one targeted A1 range and invalidate its sheet cache. */

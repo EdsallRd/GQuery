@@ -1,4 +1,7 @@
 declare namespace GQuery {
+  declare let writeObserver: ((sheetName: string) => void) | undefined;
+  /** Optional application invalidation hook; invoked only after successful writes. */
+  declare function configureGQueryWriteObserver(next?: typeof writeObserver): void;
   interface CacheOptions {
       key?: string;
       ttl?: number;
@@ -180,6 +183,18 @@ declare namespace GQuery {
   /** Extract a literal sheet title from a sheet-qualified A1 range. */
   declare function sheetNameFromRange(range: string): string | null;
 
+  interface GQueryMeasurement {
+      operation: string;
+      durationMs: number;
+      attempt: number;
+      succeeded: boolean;
+      rangeCount: number;
+      valueRows: number;
+  }
+  declare let observer: ((measurement: GQueryMeasurement) => void) | undefined;
+  /** Observe service calls without exposing spreadsheet IDs, ranges, or values. */
+  declare function configureGQueryObserver(next?: typeof observer): void;
+
   /**
    * Main GQuery class for interacting with Google Sheets
    * Provides a query-like interface for reading and writing spreadsheet data
@@ -187,11 +202,17 @@ declare namespace GQuery {
   declare class GQuery {
       spreadsheetId: string;
       readonly retries: number;
+      private readonly handles;
       /**
        * Create a new GQuery instance
        * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
        */
       constructor(spreadsheetId?: string, options?: GQueryOptions);
+      /** @internal Reuse service handles within this instance; table data stays fresh. */
+      resolveTable(spreadsheetId: string, sheetName: string): {
+          spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+          sheet: GoogleAppsScript.Spreadsheet.Sheet;
+      };
       /** Read one targeted A1 range without loading an entire sheet. */
       getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
       /** Update one targeted A1 range and invalidate its sheet cache. */
@@ -413,8 +434,8 @@ declare namespace GQuery {
       };
   }
 
-  export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, quoteSheetName, sheetNameFromRange, sheetRange };
-  export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteValuesOptions, InferSchema };
+  export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };
+  export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryMeasurement, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteValuesOptions, InferSchema };
 
 }
 declare var GQuery: typeof GQuery;

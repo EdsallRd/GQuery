@@ -8,6 +8,7 @@ import {
 } from "./types";
 import { encodeCellValue, fetchSheetData, normalizeForSchema } from "./utils";
 import { sheetRange } from "./a1";
+import { invalidateSheet } from "./cache";
 
 /**
  * Validate a single row through a Standard Schema, preserving __meta.
@@ -118,6 +119,7 @@ export function updateInternal<
       "values.batchUpdate",
       optimizedUpdates.length,
     );
+    invalidateSheet(sheetName);
   }
 
   return {

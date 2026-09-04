@@ -3,6 +3,23 @@ var GQuery = (function (exports) {
 
     const DEFAULT_RETRIES = 4;
     const MAX_RETRIES = 6;
+    let observer;
+    /** Observe service calls without exposing spreadsheet IDs, ranges, or values. */
+    function configureGQueryObserver(next) {
+        observer = next;
+    }
+    function reportRequest(operation, rangeCount, startedAt, attempt, succeeded, result) {
+        var _a, _b, _c, _d, _e, _f;
+        if (!observer)
+            return;
+        try {
+            const valueRows = Array.isArray(result === null || result === void 0 ? void 0 : result.valueRanges)
+                ? result.valueRanges.reduce((sum, range) => { var _a, _b; return sum + ((_b = (_a = range.values) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : 0); }, 0)
+                : (_f = (_d = (_c = (_b = (_a = result === null || result === void 0 ? void 0 : result.values) === null || _a === void 0 ? void 0 : _a.length) !== null && _b !== void 0 ? _b : result === null || result === void 0 ? void 0 : result.totalUpdatedRows) !== null && _c !== void 0 ? _c : result === null || result === void 0 ? void 0 : result.updatedRows) !== null && _d !== void 0 ? _d : (_e = result === null || result === void 0 ? void 0 : result.updates) === null || _e === void 0 ? void 0 : _e.updatedRows) !== null && _f !== void 0 ? _f : 0;
+            observer({ operation, rangeCount, durationMs: Date.now() - startedAt, attempt, succeeded, valueRows });
+        }
+        catch { /* Diagnostics cannot change the result of a committed request. */ }
+    }
     function normalizeRetryCount(retries = DEFAULT_RETRIES) {
         if (!Number.isInteger(retries) || retries < 0 || retries > MAX_RETRIES) {
             throw new RangeError(`GQuery retries must be an integer from 0 to ${MAX_RETRIES}.`);
@@ -13,14 +30,18 @@ var GQuery = (function (exports) {
      * Run a Sheets API request with bounded exponential backoff for quota errors.
      * `retries` counts retries after the initial request.
      */
-    function callHandler(fn, retries = DEFAULT_RETRIES) {
+    function callHandler(fn, retries = DEFAULT_RETRIES, operation = "sheets", rangeCount = 1) {
         const retryLimit = normalizeRetryCount(retries);
         let retry = 0;
         while (true) {
+            const startedAt = observer ? Date.now() : 0;
             try {
-                return fn();
+                const result = fn();
+                reportRequest(operation, rangeCount, startedAt, retry + 1, true, result);
+                return result;
             }
             catch (error) {
+                reportRequest(operation, rangeCount, startedAt, retry + 1, false);
                 const errorMessage = (error === null || error === void 0 ? void 0 : error.message) || String(error);
                 // Check if it's a rate limit or quota error
                 const isRateLimitError = errorMessage.includes("429") ||
@@ -230,7 +251,7 @@ var GQuery = (function (exports) {
      * @returns Object containing headers and rows
      */
     function fetchSheetData(spreadsheetId, sheetName, retries) {
-        const response = callHandler(() => Sheets.Spreadsheets.Values.get(spreadsheetId, sheetRange(sheetName)), retries);
+        const response = callHandler(() => Sheets.Spreadsheets.Values.get(spreadsheetId, sheetRange(sheetName)), retries, "values.get");
         const values = response.values || [];
         if (values.length === 0) {
             return { headers: [], rows: [] };
@@ -306,7 +327,7 @@ var GQuery = (function (exports) {
             ranges: sheetNames.map((sheetName) => sheetRange(sheetName)),
             valueRenderOption,
             dateTimeRenderOption,
-        }), GQuery.retries);
+        }), GQuery.retries, "values.batchGet", sheetNames.length);
         if (!dataResponse || !dataResponse.valueRanges) {
             sheetNames.forEach((sheet) => {
                 result[sheet] = { headers: [], rows: [] };
@@ -529,6 +550,83 @@ var GQuery = (function (exports) {
         };
     }
 
+    const KEY_INDEX_KEY = "gq:__keys__";
+    let writeObserver;
+    /** Optional application invalidation hook; invoked only after successful writes. */
+    function configureGQueryWriteObserver(next) {
+        writeObserver = next;
+    }
+    function defaultKey(sheetName) {
+        return `gq:${sheetName}:list`;
+    }
+    function readThrough(opts, sheetName, producer) {
+        var _a, _b;
+        const cache = CacheService.getScriptCache();
+        const key = (_a = opts === null || opts === void 0 ? void 0 : opts.key) !== null && _a !== void 0 ? _a : defaultKey(sheetName);
+        if (!(opts === null || opts === void 0 ? void 0 : opts.bypass)) {
+            const hit = cache.get(key);
+            if (hit !== null) {
+                try {
+                    return JSON.parse(hit);
+                }
+                catch { /* fall through to producer */ }
+            }
+        }
+        const value = producer();
+        try {
+            const serialized = JSON.stringify(value);
+            if (serialized.length <= 100000) {
+                cache.put(key, serialized, (_b = opts === null || opts === void 0 ? void 0 : opts.ttl) !== null && _b !== void 0 ? _b : 300);
+                trackKey(key);
+            }
+        }
+        catch {
+            /* serialization failure — return value but don't cache */
+        }
+        return value;
+    }
+    function invalidateSheet(sheetName) {
+        try {
+            writeObserver === null || writeObserver === void 0 ? void 0 : writeObserver(sheetName);
+        }
+        catch { /* A committed write stands. */ }
+        try {
+            const cache = CacheService.getScriptCache();
+            // Cache invalidation follows a committed write and must never change its result.
+            cache.remove(defaultKey(sheetName));
+            const tracked = readKeyIndex();
+            const prefix = `gq:${sheetName}:`;
+            const toRemove = tracked.filter((k) => k.startsWith(prefix));
+            if (toRemove.length > 0) {
+                cache.removeAll(toRemove);
+                writeKeyIndex(tracked.filter((k) => !toRemove.includes(k)));
+            }
+        }
+        catch {
+            // CacheService is only an optimization. The successful Sheets write stands.
+        }
+    }
+    function trackKey(key) {
+        const existing = readKeyIndex();
+        if (!existing.includes(key)) {
+            writeKeyIndex([...existing, key]);
+        }
+    }
+    function readKeyIndex() {
+        const raw = CacheService.getScriptCache().get(KEY_INDEX_KEY);
+        if (!raw)
+            return [];
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return [];
+        }
+    }
+    function writeKeyIndex(keys) {
+        CacheService.getScriptCache().put(KEY_INDEX_KEY, JSON.stringify(keys), 21600);
+    }
+
     /**
      * Validate a single row through a Standard Schema, preserving __meta.
      * Throws GQuerySchemaError if validation fails.
@@ -603,7 +701,8 @@ var GQuery = (function (exports) {
                 data: optimizedUpdates,
                 valueInputOption: "USER_ENTERED",
             };
-            callHandler(() => Sheets.Spreadsheets.Values.batchUpdate(batchUpdateRequest, spreadsheetId), retries);
+            callHandler(() => Sheets.Spreadsheets.Values.batchUpdate(batchUpdateRequest, spreadsheetId), retries, "values.batchUpdate", optimizedUpdates.length);
+            invalidateSheet(sheetName);
         }
         return {
             rows: filteredRows.length > 0 ? typedRows : [],
@@ -702,7 +801,7 @@ var GQuery = (function (exports) {
             ? data.map((item) => applySchema(schema, normalizeForSchema(item)))
             : data;
         // Fetch headers from the first row
-        const response = callHandler(() => Sheets.Spreadsheets.Values.get(spreadsheetId, sheetRange(sheetName, "1:1")), retries);
+        const response = callHandler(() => Sheets.Spreadsheets.Values.get(spreadsheetId, sheetRange(sheetName, "1:1")), retries, "values.get");
         // Validate sheet exists and has headers
         if (!response || !response.values || response.values.length === 0) {
             throw new Error(`Sheet "${sheetName}" not found or has no headers`);
@@ -723,7 +822,7 @@ var GQuery = (function (exports) {
             responseValueRenderOption: "FORMATTED_VALUE",
             responseDateTimeRenderOption: "FORMATTED_STRING",
             includeValuesInResponse: true,
-        }), retries);
+        }), retries, "values.append");
         // Validate append was successful
         if (!appendResponse ||
             !appendResponse.updates ||
@@ -819,81 +918,13 @@ var GQuery = (function (exports) {
         };
         // Execute batch delete
         try {
-            callHandler(() => Sheets.Spreadsheets.batchUpdate(batchUpdateRequest, spreadsheetId), retries);
+            callHandler(() => Sheets.Spreadsheets.batchUpdate(batchUpdateRequest, spreadsheetId), retries, "spreadsheets.batchUpdate", rowsToDelete.length);
             return { deletedRows: rowsToDelete.length };
         }
         catch (error) {
             console.error("Error deleting rows:", error);
             throw new Error(`Failed to delete rows: ${error}`);
         }
-    }
-
-    const KEY_INDEX_KEY = "gq:__keys__";
-    function defaultKey(sheetName) {
-        return `gq:${sheetName}:list`;
-    }
-    function readThrough(opts, sheetName, producer) {
-        var _a, _b;
-        const cache = CacheService.getScriptCache();
-        const key = (_a = opts === null || opts === void 0 ? void 0 : opts.key) !== null && _a !== void 0 ? _a : defaultKey(sheetName);
-        if (!(opts === null || opts === void 0 ? void 0 : opts.bypass)) {
-            const hit = cache.get(key);
-            if (hit !== null) {
-                try {
-                    return JSON.parse(hit);
-                }
-                catch { /* fall through to producer */ }
-            }
-        }
-        const value = producer();
-        try {
-            const serialized = JSON.stringify(value);
-            if (serialized.length <= 100000) {
-                cache.put(key, serialized, (_b = opts === null || opts === void 0 ? void 0 : opts.ttl) !== null && _b !== void 0 ? _b : 300);
-                trackKey(key);
-            }
-        }
-        catch {
-            /* serialization failure — return value but don't cache */
-        }
-        return value;
-    }
-    function invalidateSheet(sheetName) {
-        try {
-            const cache = CacheService.getScriptCache();
-            // Cache invalidation follows a committed write and must never change its result.
-            cache.remove(defaultKey(sheetName));
-            const tracked = readKeyIndex();
-            const prefix = `gq:${sheetName}:`;
-            const toRemove = tracked.filter((k) => k.startsWith(prefix));
-            if (toRemove.length > 0) {
-                cache.removeAll(toRemove);
-                writeKeyIndex(tracked.filter((k) => !toRemove.includes(k)));
-            }
-        }
-        catch {
-            // CacheService is only an optimization. The successful Sheets write stands.
-        }
-    }
-    function trackKey(key) {
-        const existing = readKeyIndex();
-        if (!existing.includes(key)) {
-            writeKeyIndex([...existing, key]);
-        }
-    }
-    function readKeyIndex() {
-        const raw = CacheService.getScriptCache().get(KEY_INDEX_KEY);
-        if (!raw)
-            return [];
-        try {
-            return JSON.parse(raw);
-        }
-        catch {
-            return [];
-        }
-    }
-    function writeKeyIndex(keys) {
-        CacheService.getScriptCache().put(KEY_INDEX_KEY, JSON.stringify(keys), 21600);
     }
 
     function valuesMatrix(values) {
@@ -946,7 +977,7 @@ var GQuery = (function (exports) {
             majorDimension: options.majorDimension,
             valueRenderOption: options.valueRenderOption,
             dateTimeRenderOption: options.dateTimeRenderOption,
-        }), client.retries);
+        }), client.retries, "values.get");
         return normalizedValueRange(response, range);
     }
     function updateValuesInternal(client, range, values, options = {}) {
@@ -958,7 +989,7 @@ var GQuery = (function (exports) {
                 responseValueRenderOption: options.responseValueRenderOption,
                 responseDateTimeRenderOption: options.responseDateTimeRenderOption,
             });
-        }, client.retries);
+        }, client.retries, "values.update");
         invalidateRanges([range]);
         return normalizedUpdate(response, client.spreadsheetId, range);
     }
@@ -969,6 +1000,13 @@ var GQuery = (function (exports) {
             majorDimension: range.majorDimension,
             values: valuesMatrix(range.values),
         }));
+        if (data.every(({ values }) => values.every((row) => row.length === 0))) {
+            return {
+                spreadsheetId: client.spreadsheetId,
+                totalUpdatedRows: 0, totalUpdatedColumns: 0, totalUpdatedCells: 0, totalUpdatedSheets: 0,
+                responses: ranges.map(({ range }) => normalizedUpdate(undefined, client.spreadsheetId, range)),
+            };
+        }
         const response = callHandler(() => {
             var _a;
             return Sheets.Spreadsheets.Values.batchUpdate({
@@ -978,7 +1016,7 @@ var GQuery = (function (exports) {
                 responseValueRenderOption: options.responseValueRenderOption,
                 responseDateTimeRenderOption: options.responseDateTimeRenderOption,
             }, client.spreadsheetId);
-        }, client.retries);
+        }, client.retries, "values.batchUpdate", ranges.length);
         invalidateRanges(ranges.map(({ range }) => range));
         return {
             spreadsheetId: (_a = response === null || response === void 0 ? void 0 : response.spreadsheetId) !== null && _a !== void 0 ? _a : client.spreadsheetId,
@@ -1000,7 +1038,7 @@ var GQuery = (function (exports) {
                 responseValueRenderOption: options.responseValueRenderOption,
                 responseDateTimeRenderOption: options.responseDateTimeRenderOption,
             });
-        }, client.retries);
+        }, client.retries, "values.append");
         const updatedRange = (_a = response === null || response === void 0 ? void 0 : response.updates) === null || _a === void 0 ? void 0 : _a.updatedRange;
         if (!updatedRange)
             throw new Error("Sheets append did not return an updated range.");
@@ -1021,10 +1059,27 @@ var GQuery = (function (exports) {
          * @param spreadsheetId Optional spreadsheet ID. If not provided, uses the active spreadsheet
          */
         constructor(spreadsheetId, options = {}) {
+            this.handles = new Map();
             this.spreadsheetId = spreadsheetId
                 ? spreadsheetId
                 : SpreadsheetApp.getActiveSpreadsheet().getId();
             this.retries = normalizeRetryCount(options.retries);
+        }
+        /** @internal Reuse service handles within this instance; table data stays fresh. */
+        resolveTable(spreadsheetId, sheetName) {
+            var _a;
+            let handles = this.handles.get(spreadsheetId);
+            if (!handles) {
+                handles = { spreadsheet: SpreadsheetApp.openById(spreadsheetId), sheets: new Map() };
+                this.handles.set(spreadsheetId, handles);
+            }
+            let sheet = handles.sheets.get(sheetName);
+            if (!sheet) {
+                sheet = (_a = handles.spreadsheet.getSheetByName(sheetName)) !== null && _a !== void 0 ? _a : undefined;
+                if (sheet)
+                    handles.sheets.set(sheetName, sheet);
+            }
+            return { spreadsheet: handles.spreadsheet, sheet: sheet };
         }
         /** Read one targeted A1 range without loading an entire sheet. */
         getValues(range, options) {
@@ -1065,8 +1120,9 @@ var GQuery = (function (exports) {
         constructor(GQuery, spreadsheetId, sheetName, schema) {
             this.spreadsheetId = spreadsheetId;
             this.sheetName = sheetName;
-            this.spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-            this.sheet = this.spreadsheet.getSheetByName(sheetName);
+            const handles = GQuery.resolveTable(spreadsheetId, sheetName);
+            this.spreadsheet = handles.spreadsheet;
+            this.sheet = handles.sheet;
             this.GQuery = GQuery;
             this.schema = schema;
         }
@@ -1143,9 +1199,7 @@ var GQuery = (function (exports) {
          * @returns GQueryResult with updated rows
          */
         update(updateFn) {
-            const result = new GQueryTableFactory(this).update(updateFn);
-            invalidateSheet(this.sheetName);
-            return result;
+            return new GQueryTableFactory(this).update(updateFn);
         }
         /**
          * Append new rows to the sheet.
@@ -1158,7 +1212,8 @@ var GQuery = (function (exports) {
         append(data, options) {
             const dataArray = Array.isArray(data) ? data : [data];
             const result = appendInternal(this, dataArray, options);
-            invalidateSheet(this.sheetName);
+            if (dataArray.length > 0)
+                invalidateSheet(this.sheetName);
             return result;
         }
         /**
@@ -1226,9 +1281,7 @@ var GQuery = (function (exports) {
          * @returns Object with count of deleted rows
          */
         delete() {
-            const result = new GQueryTableFactory(this).delete();
-            invalidateSheet(this.sheetName);
-            return result;
+            return new GQueryTableFactory(this).delete();
         }
     }
     /**
@@ -1288,19 +1341,19 @@ var GQuery = (function (exports) {
             return this.uncachedGet(options);
         }
         update(updateFn) {
-            const result = updateInternal(this, updateFn);
-            invalidateSheet(this.GQueryTable.sheetName);
-            return result;
+            return updateInternal(this, updateFn);
         }
         append(data, options) {
             const dataArray = Array.isArray(data) ? data : [data];
             const result = appendInternal(this.GQueryTable, dataArray, options);
-            invalidateSheet(this.GQueryTable.sheetName);
+            if (dataArray.length > 0)
+                invalidateSheet(this.GQueryTable.sheetName);
             return result;
         }
         delete() {
             const result = deleteInternal(this);
-            invalidateSheet(this.GQueryTable.sheetName);
+            if (result.deletedRows > 0)
+                invalidateSheet(this.GQueryTable.sheetName);
             return result;
         }
     }
@@ -1309,6 +1362,8 @@ var GQuery = (function (exports) {
     exports.GQuerySchemaError = GQuerySchemaError;
     exports.GQueryTable = GQueryTable;
     exports.GQueryTableFactory = GQueryTableFactory;
+    exports.configureGQueryObserver = configureGQueryObserver;
+    exports.configureGQueryWriteObserver = configureGQueryWriteObserver;
     exports.quoteSheetName = quoteSheetName;
     exports.sheetNameFromRange = sheetNameFromRange;
     exports.sheetRange = sheetRange;

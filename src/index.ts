@@ -29,6 +29,7 @@ import {
 } from "./types";
 
 export type { CacheOptions };
+export { configureGQueryWriteObserver } from "./cache";
 
 export * from "./types";
 export * from "./a1";
@@ -42,6 +43,10 @@ export type { GQueryMeasurement } from "./ratelimit";
 export class GQuery {
   spreadsheetId: string;
   readonly retries: number;
+  private readonly handles = new Map<string, {
+    spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+    sheets: Map<string, GoogleAppsScript.Spreadsheet.Sheet>;
+  }>();
 
   /**
    * Create a new GQuery instance
@@ -52,6 +57,21 @@ export class GQuery {
       ? spreadsheetId
       : SpreadsheetApp.getActiveSpreadsheet().getId();
     this.retries = normalizeRetryCount(options.retries);
+  }
+
+  /** @internal Reuse service handles within this instance; table data stays fresh. */
+  resolveTable(spreadsheetId: string, sheetName: string) {
+    let handles = this.handles.get(spreadsheetId);
+    if (!handles) {
+      handles = { spreadsheet: SpreadsheetApp.openById(spreadsheetId), sheets: new Map() };
+      this.handles.set(spreadsheetId, handles);
+    }
+    let sheet = handles.sheets.get(sheetName);
+    if (!sheet) {
+      sheet = handles.spreadsheet.getSheetByName(sheetName) ?? undefined;
+      if (sheet) handles.sheets.set(sheetName, sheet);
+    }
+    return { spreadsheet: handles.spreadsheet, sheet: sheet! };
   }
 
   /** Read one targeted A1 range without loading an entire sheet. */
@@ -171,8 +191,9 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   ) {
     this.spreadsheetId = spreadsheetId;
     this.sheetName = sheetName;
-    this.spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-    this.sheet = this.spreadsheet.getSheetByName(sheetName)!;
+    const handles = GQuery.resolveTable(spreadsheetId, sheetName);
+    this.spreadsheet = handles.spreadsheet;
+    this.sheet = handles.sheet;
     this.GQuery = GQuery;
     this.schema = schema;
   }
@@ -267,9 +288,7 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    * @returns GQueryResult with updated rows
    */
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {
-    const result = new GQueryTableFactory<T>(this).update(updateFn);
-    invalidateSheet(this.sheetName);
-    return result;
+    return new GQueryTableFactory<T>(this).update(updateFn);
   }
 
   /**
@@ -286,7 +305,7 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
     const result = appendInternal<T>(this, dataArray, options);
-    invalidateSheet(this.sheetName);
+    if (dataArray.length > 0) invalidateSheet(this.sheetName);
     return result;
   }
 
@@ -364,9 +383,7 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    * @returns Object with count of deleted rows
    */
   delete(): { deletedRows: number } {
-    const result = new GQueryTableFactory<T>(this).delete();
-    invalidateSheet(this.sheetName);
-    return result;
+    return new GQueryTableFactory<T>(this).delete();
   }
 }
 
@@ -461,9 +478,7 @@ export class GQueryTableFactory<
   }
 
   update(updateFn: (row: GQueryRow<T>) => Partial<T>): GQueryResult<T> {
-    const result = updateInternal<T>(this, updateFn);
-    invalidateSheet(this.GQueryTable.sheetName);
-    return result;
+    return updateInternal<T>(this, updateFn);
   }
 
   append(
@@ -472,13 +487,13 @@ export class GQueryTableFactory<
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
     const result = appendInternal<T>(this.GQueryTable, dataArray, options);
-    invalidateSheet(this.GQueryTable.sheetName);
+    if (dataArray.length > 0) invalidateSheet(this.GQueryTable.sheetName);
     return result;
   }
 
   delete(): { deletedRows: number } {
     const result = deleteInternal(this);
-    invalidateSheet(this.GQueryTable.sheetName);
+    if (result.deletedRows > 0) invalidateSheet(this.GQueryTable.sheetName);
     return result;
   }
 }

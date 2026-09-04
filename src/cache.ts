@@ -1,4 +1,10 @@
 const KEY_INDEX_KEY = "gq:__keys__";
+let writeObserver: ((sheetName: string) => void) | undefined;
+
+/** Optional application invalidation hook; invoked only after successful writes. */
+export function configureGQueryWriteObserver(next?: typeof writeObserver): void {
+  writeObserver = next;
+}
 
 export interface CacheOptions {
   key?: string;
@@ -37,6 +43,7 @@ export function readThrough<T>(
 }
 
 export function invalidateSheet(sheetName: string): void {
+  try { writeObserver?.(sheetName); } catch { /* A committed write stands. */ }
   try {
     const cache = CacheService.getScriptCache();
     // Cache invalidation follows a committed write and must never change its result.
