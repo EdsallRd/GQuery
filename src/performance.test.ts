@@ -55,7 +55,7 @@ it("does not retain a missing sheet handle after the sheet is created", () => {
   const getSheetByName = vi.fn().mockReturnValueOnce(null).mockReturnValue({ getSheetId: () => 1 });
   vi.stubGlobal("SpreadsheetApp", { openById: () => ({ getSheetByName }) });
   const query = new GQuery("spreadsheet");
-  expect(query.from("Assets").sheet).toBeUndefined();
+  expect(query.from("Assets").sheet).toBeNull();
   expect(query.from("Assets").sheet).toBeDefined();
   expect(getSheetByName).toHaveBeenCalledTimes(2);
 });

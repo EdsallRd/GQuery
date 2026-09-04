@@ -66,11 +66,8 @@ export class GQuery {
       handles = { spreadsheet: SpreadsheetApp.openById(spreadsheetId), sheets: new Map() };
       this.handles.set(spreadsheetId, handles);
     }
-    let sheet = handles.sheets.get(sheetName);
-    if (!sheet) {
-      sheet = handles.spreadsheet.getSheetByName(sheetName) ?? undefined;
-      if (sheet) handles.sheets.set(sheetName, sheet);
-    }
+    const sheet = handles.sheets.get(sheetName) ?? handles.spreadsheet.getSheetByName(sheetName);
+    if (sheet) handles.sheets.set(sheetName, sheet);
     return { spreadsheet: handles.spreadsheet, sheet: sheet! };
   }
 
