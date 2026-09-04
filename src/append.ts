@@ -67,6 +67,7 @@ export function appendInternal<
         sheetRange(sheetName, "1:1"),
       ),
     retries,
+    "values.get",
   );
 
   // Validate sheet exists and has headers
@@ -101,6 +102,7 @@ export function appendInternal<
         },
       ),
     retries,
+    "values.append",
   );
 
   // Validate append was successful

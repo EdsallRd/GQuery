@@ -90,6 +90,7 @@ export function getValuesInternal(
         dateTimeRenderOption: options.dateTimeRenderOption,
       }),
     client.retries,
+    "values.get",
   );
   return normalizedValueRange(response, range);
 }
@@ -114,6 +115,7 @@ export function updateValuesInternal(
         },
       ),
     client.retries,
+    "values.update",
   );
   invalidateRanges([range]);
   return normalizedUpdate(response, client.spreadsheetId, range);
@@ -142,6 +144,8 @@ export function batchUpdateValuesInternal(
         client.spreadsheetId,
       ),
     client.retries,
+    "values.batchUpdate",
+    ranges.length,
   );
   invalidateRanges(ranges.map(({ range }) => range));
   return {
@@ -177,6 +181,7 @@ export function appendValuesInternal(
         },
       ),
     client.retries,
+    "values.append",
   );
   const updatedRange = response?.updates?.updatedRange;
   if (!updatedRange) throw new Error("Sheets append did not return an updated range.");

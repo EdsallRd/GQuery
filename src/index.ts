@@ -32,6 +32,8 @@ export type { CacheOptions };
 
 export * from "./types";
 export * from "./a1";
+export { configureGQueryObserver } from "./ratelimit";
+export type { GQueryMeasurement } from "./ratelimit";
 
 /**
  * Main GQuery class for interacting with Google Sheets

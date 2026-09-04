@@ -115,6 +115,8 @@ export function updateInternal<
           spreadsheetId,
         ),
       retries,
+      "values.batchUpdate",
+      optimizedUpdates.length,
     );
   }
 

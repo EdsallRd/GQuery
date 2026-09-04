@@ -153,6 +153,7 @@ export function fetchSheetData(
         sheetRange(sheetName),
       ),
     retries,
+    "values.get",
   );
 
   const values = response.values || [];

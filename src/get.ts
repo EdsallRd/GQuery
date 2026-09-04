@@ -114,6 +114,8 @@ export function getManyInternal(
         dateTimeRenderOption,
       }),
     GQuery.retries,
+    "values.batchGet",
+    sheetNames.length,
   );
 
   if (!dataResponse || !dataResponse.valueRanges) {
