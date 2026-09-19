@@ -415,7 +415,10 @@ const rows = snapshot.from("Assets").join("Models", "Model_Name", "Model")
 Projected reads fetch fresh headers in one batch, then selected columns in a
 second batch. Include every field needed by subsequent filters and joins, plus
 an identity column to retain rows whose other selected cells are blank. Missing
-or duplicate requested headers fail before reading data. Existing `select()`
+or duplicate requested headers fail before reading data. For legacy display data,
+`getManyProjected(selections, { optionalColumns: { Assets: ["Assigned_Date"] } })`
+fills a missing optional column with empty cells; duplicate headers still fail.
+Keep the identity column required. Existing `select()`
 remains an in-memory projection and does not reduce the Sheets range.
 
 Snapshots are explicit read-only values; independent query builders reuse the

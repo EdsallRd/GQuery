@@ -116,6 +116,10 @@ interface GQueryAppendValuesResult extends GQueryUpdateValuesResult {
 /**
  * Options for reading data from Google Sheets
  */
+type GQueryProjectedReadOptions = GQueryReadOptions & {
+    /** Missing legacy display columns become empty cells; duplicate headers still fail. */
+    optionalColumns?: Record<string, readonly string[]>;
+};
 type GQueryReadOptions = {
     /** How values should be rendered in the output */
     valueRenderOption?: ValueRenderOption | GQueryValueRenderOption;
@@ -245,7 +249,7 @@ declare class GQuery {
     /** Read multiple targeted ranges in one Sheets request, preserving input order. */
     batchGetValues(ranges: readonly string[], options?: GQueryGetValuesOptions): GQueryValueRangeResult[];
     /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
-    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult>;
+    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryProjectedReadOptions): Record<string, GQueryResult>;
     /** Capture explicit read-only tables for reuse within the current operation. */
     readSnapshot(sheetNames: readonly string[], options?: GQueryReadOptions): GQueryReadSnapshot;
     /** Structural atomic batch. Append-containing batches must not be blindly replayed. */
@@ -477,4 +481,4 @@ declare class GQueryTableFactory<T extends Record<string, any> = Record<string, 
 }
 
 export { DateTimeRenderOption, GQuery, GQueryReadSnapshot, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };
-export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryMeasurement, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteMetadata, GQueryWriteValuesOptions, InferSchema };
+export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryMeasurement, GQueryOptions, GQueryProjectedReadOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteMetadata, GQueryWriteValuesOptions, InferSchema };

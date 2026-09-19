@@ -1,7 +1,7 @@
 import { type CacheOptions } from "./cache";
 import { GQueryReadSnapshot } from "./snapshot";
 export { GQueryReadSnapshot } from "./snapshot";
-import { GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryGetValuesOptions, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueRangeInput, GQueryValueRangeResult, GQueryWriteValuesOptions, InferSchema, StandardSchemaV1 } from "./types";
+import { GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryGetValuesOptions, GQueryOptions, GQueryReadOptions, GQueryProjectedReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueRangeInput, GQueryValueRangeResult, GQueryWriteValuesOptions, InferSchema, StandardSchemaV1 } from "./types";
 export type { CacheOptions };
 export type { GQueryWriteMetadata } from "./cache";
 export { configureGQueryWriteObserver } from "./cache";
@@ -32,7 +32,7 @@ export declare class GQuery {
     /** Read multiple targeted ranges in one Sheets request, preserving input order. */
     batchGetValues(ranges: readonly string[], options?: GQueryGetValuesOptions): GQueryValueRangeResult[];
     /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
-    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult>;
+    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryProjectedReadOptions): Record<string, GQueryResult>;
     /** Capture explicit read-only tables for reuse within the current operation. */
     readSnapshot(sheetNames: readonly string[], options?: GQueryReadOptions): GQueryReadSnapshot;
     /** Structural atomic batch. Append-containing batches must not be blindly replayed. */

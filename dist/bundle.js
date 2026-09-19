@@ -993,21 +993,24 @@ function getManyProjectedInternal(client, selections, options = {}) {
         const available = ((_a = headers[index].values[0]) !== null && _a !== void 0 ? _a : []).map(String);
         const selected = [...new Set(selections[sheet])];
         const indexes = selected.map((column) => {
+            var _a, _b;
             const matches = available.flatMap((header, position) => header === column ? [position] : []);
+            if (matches.length === 0 && ((_b = (_a = options.optionalColumns) === null || _a === void 0 ? void 0 : _a[sheet]) === null || _b === void 0 ? void 0 : _b.includes(column)))
+                return -1;
             if (matches.length !== 1)
                 throw new Error(`Projected column must exist exactly once: ${sheet}.${column}`);
             return matches[0];
         });
         return { sheet, selected, indexes };
     });
-    const ranges = plans.flatMap((plan) => plan.indexes.map((index) => {
+    const ranges = plans.flatMap((plan) => plan.indexes.filter((index) => index >= 0).map((index) => {
         const letter = columnLetter(index);
         return sheetRange(plan.sheet, `${letter}2:${letter}`);
     }));
     const values = client.batchGetValues(ranges, render);
     let cursor = 0;
     return Object.fromEntries(plans.map(({ sheet, selected, indexes }) => {
-        const columns = indexes.map(() => values[cursor++].values);
+        const columns = indexes.map((index) => index < 0 ? [] : values[cursor++].values);
         const count = Math.max(0, ...columns.map((column) => column.length));
         const matrix = Array.from({ length: count }, (_, row) => columns.map((column) => { var _a, _b; return (_b = (_a = column[row]) === null || _a === void 0 ? void 0 : _a[0]) !== null && _b !== void 0 ? _b : ""; }));
         return [sheet, { headers: selected,
