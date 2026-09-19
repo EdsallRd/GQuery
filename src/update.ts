@@ -70,6 +70,7 @@ export function updateInternal<
 
   // Collect changed cells
   const changedCells = new Map<string, any[]>();
+  const changedColumns = new Set<string>();
 
   updatedRows.forEach((updatedRow) => {
     const rowIndex = updatedRow.__meta.rowNum - 2;
@@ -81,6 +82,7 @@ export function updateInternal<
 
       // Skip if values are the same
       if (originalValue === updatedValue) return;
+      changedColumns.add(header);
 
       // Only update if value changed or is being set/cleared
       if (updatedValue !== undefined && updatedValue !== null) {
@@ -119,7 +121,7 @@ export function updateInternal<
       "values.batchUpdate",
       optimizedUpdates.length,
     );
-    invalidateSheet(sheetName);
+    invalidateSheet(sheetName, { spreadsheetId, columns: [...changedColumns] });
   }
 
   return {

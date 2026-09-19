@@ -3,8 +3,12 @@ import { updateInternal } from "./update";
 import { appendInternal, appendOneInternal } from "./append";
 import { deleteInternal } from "./delete";
 import { readThrough, invalidateSheet, type CacheOptions } from "./cache";
-import { normalizeRetryCount } from "./ratelimit";
+import { callHandler, normalizeRetryCount } from "./ratelimit";
+import { GQueryReadSnapshot } from "./snapshot";
+export { GQueryReadSnapshot } from "./snapshot";
+import { getManyProjectedInternal } from "./projected";
 import {
+  batchGetValuesInternal,
   appendValuesInternal,
   batchUpdateValuesInternal,
   getValuesInternal,
@@ -29,6 +33,7 @@ import {
 } from "./types";
 
 export type { CacheOptions };
+export type { GQueryWriteMetadata } from "./cache";
 export { configureGQueryWriteObserver } from "./cache";
 
 export * from "./types";
@@ -77,6 +82,34 @@ export class GQuery {
     options?: GQueryGetValuesOptions,
   ): GQueryValueRangeResult {
     return getValuesInternal(this, range, options);
+  }
+
+  /** Read multiple targeted ranges in one Sheets request, preserving input order. */
+  batchGetValues(ranges: readonly string[], options?: GQueryGetValuesOptions): GQueryValueRangeResult[] {
+    return batchGetValuesInternal(this, ranges, options);
+  }
+
+  /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
+  getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult> {
+    return getManyProjectedInternal(this, selections, options);
+  }
+
+  /** Capture explicit read-only tables for reuse within the current operation. */
+  readSnapshot(sheetNames: readonly string[], options?: GQueryReadOptions): GQueryReadSnapshot {
+    return new GQueryReadSnapshot(this.getMany([...sheetNames], options));
+  }
+
+  /** Structural atomic batch. Append-containing batches must not be blindly replayed. */
+  batchUpdate(
+    requests: readonly GoogleAppsScript.Sheets.Schema.Request[],
+    options: { affectedSheets?: readonly string[]; retries?: number } = {},
+  ): GoogleAppsScript.Sheets.Schema.BatchUpdateSpreadsheetResponse {
+    if (requests.length === 0) return { spreadsheetId: this.spreadsheetId, replies: [] };
+    const response = callHandler(() => Sheets!.Spreadsheets!.batchUpdate(
+      { requests: [...requests] }, this.spreadsheetId,
+    ), options.retries ?? 0, "spreadsheets.batchUpdate", requests.length);
+    for (const sheet of new Set(options.affectedSheets ?? [])) invalidateSheet(sheet, { spreadsheetId: this.spreadsheetId });
+    return response;
   }
 
   /** Update one targeted A1 range and invalidate its sheet cache. */
@@ -172,9 +205,17 @@ export class GQuery {
 export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   GQuery: GQuery;
   spreadsheetId: string;
-  spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+  private nativeSpreadsheet?: GoogleAppsScript.Spreadsheet.Spreadsheet;
+  private nativeSheet?: GoogleAppsScript.Spreadsheet.Sheet;
   sheetName: string;
-  sheet: GoogleAppsScript.Spreadsheet.Sheet;
+  get spreadsheet(): GoogleAppsScript.Spreadsheet.Spreadsheet {
+    return this.nativeSpreadsheet ?? this.GQuery.resolveTable(this.spreadsheetId, this.sheetName).spreadsheet;
+  }
+  set spreadsheet(value: GoogleAppsScript.Spreadsheet.Spreadsheet) { this.nativeSpreadsheet = value; }
+  get sheet(): GoogleAppsScript.Spreadsheet.Sheet {
+    return this.nativeSheet ?? this.GQuery.resolveTable(this.spreadsheetId, this.sheetName).sheet;
+  }
+  set sheet(value: GoogleAppsScript.Spreadsheet.Sheet) { this.nativeSheet = value; }
   /** The Standard Schema used for type inference and optional runtime validation */
   schema?: StandardSchemaV1<unknown, T>;
   /** Cache options set by .cached() — undefined means no caching */
@@ -188,9 +229,6 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   ) {
     this.spreadsheetId = spreadsheetId;
     this.sheetName = sheetName;
-    const handles = GQuery.resolveTable(spreadsheetId, sheetName);
-    this.spreadsheet = handles.spreadsheet;
-    this.sheet = handles.sheet;
     this.GQuery = GQuery;
     this.schema = schema;
   }
@@ -302,7 +340,7 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
     const result = appendInternal<T>(this, dataArray, options);
-    if (dataArray.length > 0) invalidateSheet(this.sheetName);
+    if (dataArray.length > 0) invalidateSheet(this.sheetName, { spreadsheetId: this.spreadsheetId });
     return result;
   }
 
@@ -314,7 +352,7 @@ export class GQueryTable<T extends Record<string, any> = Record<string, any>> {
    */
   appendOne(row: T, options?: Pick<GQueryReadOptions, "validate">): GQueryRow<T> {
     const result = appendOneInternal<T>(this, row, options);
-    invalidateSheet(this.sheetName);
+    invalidateSheet(this.sheetName, { spreadsheetId: this.spreadsheetId });
     return result;
   }
 
@@ -484,13 +522,13 @@ export class GQueryTableFactory<
   ): GQueryResult<T> {
     const dataArray = Array.isArray(data) ? data : [data];
     const result = appendInternal<T>(this.GQueryTable, dataArray, options);
-    if (dataArray.length > 0) invalidateSheet(this.GQueryTable.sheetName);
+    if (dataArray.length > 0) invalidateSheet(this.GQueryTable.sheetName, { spreadsheetId: this.GQueryTable.spreadsheetId });
     return result;
   }
 
   delete(): { deletedRows: number } {
     const result = deleteInternal(this);
-    if (result.deletedRows > 0) invalidateSheet(this.GQueryTable.sheetName);
+    if (result.deletedRows > 0) invalidateSheet(this.GQueryTable.sheetName, { spreadsheetId: this.GQueryTable.spreadsheetId });
     return result;
   }
 }

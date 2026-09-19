@@ -171,22 +171,33 @@ export function getInternal<
   // Read data from all required sheets at once
   const results = GQuery.getMany(sheetsToRead, options);
 
+  return querySnapshotRows<T>(results, GQueryTable.sheetName, GQueryTableFactory, options, GQueryTable.schema, orderBy, limit, offset);
+}
+
+export type ReadQueryPlan = Pick<GQueryTableFactory<any>, "joinOption" | "filterOption" | "selectOption">;
+
+/** Pure query evaluation; never accesses Sheets or creates native handles. */
+export function querySnapshotRows<T extends Record<string, any> = Record<string, any>>(
+  results: Record<string, GQueryResult>, sheetName: string, plan: ReadQueryPlan,
+  options?: GQueryReadOptions, schema?: StandardSchemaV1<unknown, T>,
+  orderBy?: { field: string; direction: "asc" | "desc" }, limit?: number, offset?: number,
+): GQueryResult<T> {
   // If the main sheet doesn't exist or has no data
   if (
-    !results[GQueryTable.sheetName] ||
-    results[GQueryTable.sheetName].rows.length === 0
+    !results[sheetName] ||
+    results[sheetName].rows.length === 0
   ) {
     return { headers: [], rows: [] };
   }
 
   // Get data for the primary table
-  let result = results[GQueryTable.sheetName];
+  let result = results[sheetName];
   let rows = result.rows;
   let headers = result.headers;
 
   // Process each join sequentially
-  if (GQueryTableFactory.joinOption.length > 0) {
-    GQueryTableFactory.joinOption.forEach((joinConfig) => {
+  if (plan.joinOption.length > 0) {
+    plan.joinOption.forEach((joinConfig) => {
       const { sheetName, sheetColumn, joinColumn, columnsToReturn } =
         joinConfig;
 
@@ -245,16 +256,16 @@ export function getInternal<
   }
 
   // Apply filter if specified
-  if (GQueryTableFactory.filterOption) {
-    rows = rows.filter(GQueryTableFactory.filterOption);
+  if (plan.filterOption) {
+    rows = rows.filter(plan.filterOption);
   }
 
   // Apply select if specified — narrows columns and shifts the effective `headers`
   // we return. Sort/paginate/validate run once below regardless of branch.
   let outputHeaders = headers;
   if (
-    GQueryTableFactory.selectOption &&
-    GQueryTableFactory.selectOption.length > 0
+    plan.selectOption &&
+    plan.selectOption.length > 0
   ) {
     // Create a map to track columns from joined tables
     const joinedColumns = new Set<string>();
@@ -275,23 +286,23 @@ export function getInternal<
     // Check if any of the selected headers is "Model" or "Model_Name"
     // If we're selecting the join columns, we want to include all related joined fields
     if (
-      GQueryTableFactory.selectOption.some(
+      plan.selectOption.some(
         (header) =>
           header === "Model" ||
           header === "Model_Name" ||
-          GQueryTableFactory.joinOption.some(
+          plan.joinOption.some(
             (j) => j.joinColumn === header || j.sheetColumn === header,
           ),
       )
     ) {
       // Include all join-related columns and the selected columns
-      selectedHeaders = [...GQueryTableFactory.selectOption];
+      selectedHeaders = [...plan.selectOption];
       joinedColumns.forEach((joinCol) => {
         selectedHeaders.push(joinCol);
       });
     } else {
       // Otherwise only include explicitly selected columns
-      selectedHeaders = [...GQueryTableFactory.selectOption];
+      selectedHeaders = [...plan.selectOption];
     }
 
     // Remove duplicates
@@ -321,8 +332,8 @@ export function getInternal<
 
   // Apply schema validation if requested
   const typedRows =
-    GQueryTable.schema && options?.validate
-      ? applySchemaToRows(GQueryTable.schema, rows)
+    schema && options?.validate
+      ? applySchemaToRows(schema, rows)
       : (rows as unknown as GQueryRow<T>[]);
 
   return {

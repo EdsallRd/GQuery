@@ -1,4 +1,9 @@
-declare let writeObserver: ((sheetName: string) => void) | undefined;
+interface GQueryWriteMetadata {
+    spreadsheetId: string;
+    /** Omitted when the operation can affect arbitrary columns or row structure. */
+    columns?: readonly string[];
+}
+declare let writeObserver: ((sheetName: string, metadata?: GQueryWriteMetadata) => void) | undefined;
 /** Optional application invalidation hook; invoked only after successful writes. */
 declare function configureGQueryWriteObserver(next?: typeof writeObserver): void;
 interface CacheOptions {
@@ -175,6 +180,29 @@ declare class GQuerySchemaError extends Error {
     constructor(issues: ReadonlyArray<StandardSchemaV1.Issue>, row: Record<string, any>);
 }
 
+/** Explicit, read-only snapshot. Create a new one after writes; never shared across RPCs. */
+declare class GQueryReadSnapshot {
+    private readonly tables;
+    constructor(tables: Record<string, GQueryResult>);
+    from<T extends Record<string, any> = Record<string, any>>(sheetName: string): GQuerySnapshotTable<T>;
+}
+declare class GQuerySnapshotTable<T extends Record<string, any> = Record<string, any>> {
+    private readonly tables;
+    private readonly sheetName;
+    private readonly plan;
+    private ordering?;
+    private count?;
+    private skip?;
+    constructor(tables: Record<string, GQueryResult>, sheetName: string);
+    where(predicate: (row: GQueryRow<T>) => boolean): this;
+    select(columns: string[]): this;
+    join(sheetName: string, sheetColumn: string, joinColumn: string, columnsToReturn?: string[]): this;
+    orderBy(field: keyof T & string, direction?: "asc" | "desc"): this;
+    limit(count: number): this;
+    offset(skip: number): this;
+    get(): GQueryResult<T>;
+}
+
 /** Quote a sheet title for use in Google Sheets A1 notation. */
 declare function quoteSheetName(sheetName: string): string;
 /** Build an A1 range from a literal sheet title and an optional cell range. */
@@ -214,6 +242,17 @@ declare class GQuery {
     };
     /** Read one targeted A1 range without loading an entire sheet. */
     getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
+    /** Read multiple targeted ranges in one Sheets request, preserving input order. */
+    batchGetValues(ranges: readonly string[], options?: GQueryGetValuesOptions): GQueryValueRangeResult[];
+    /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
+    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult>;
+    /** Capture explicit read-only tables for reuse within the current operation. */
+    readSnapshot(sheetNames: readonly string[], options?: GQueryReadOptions): GQueryReadSnapshot;
+    /** Structural atomic batch. Append-containing batches must not be blindly replayed. */
+    batchUpdate(requests: readonly GoogleAppsScript.Sheets.Schema.Request[], options?: {
+        affectedSheets?: readonly string[];
+        retries?: number;
+    }): GoogleAppsScript.Sheets.Schema.BatchUpdateSpreadsheetResponse;
     /** Update one targeted A1 range and invalidate its sheet cache. */
     updateValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryWriteValuesOptions): GQueryUpdateValuesResult;
     /** Atomically update several targeted A1 ranges. */
@@ -262,9 +301,13 @@ declare class GQuery {
 declare class GQueryTable<T extends Record<string, any> = Record<string, any>> {
     GQuery: GQuery;
     spreadsheetId: string;
-    spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+    private nativeSpreadsheet?;
+    private nativeSheet?;
     sheetName: string;
-    sheet: GoogleAppsScript.Spreadsheet.Sheet;
+    get spreadsheet(): GoogleAppsScript.Spreadsheet.Spreadsheet;
+    set spreadsheet(value: GoogleAppsScript.Spreadsheet.Spreadsheet);
+    get sheet(): GoogleAppsScript.Spreadsheet.Sheet;
+    set sheet(value: GoogleAppsScript.Spreadsheet.Sheet);
     /** The Standard Schema used for type inference and optional runtime validation */
     schema?: StandardSchemaV1<unknown, T>;
     /** Cache options set by .cached() — undefined means no caching */
@@ -433,5 +476,5 @@ declare class GQueryTableFactory<T extends Record<string, any> = Record<string, 
     };
 }
 
-export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };
-export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryMeasurement, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteValuesOptions, InferSchema };
+export { DateTimeRenderOption, GQuery, GQueryReadSnapshot, GQuerySchemaError, GQueryTable, GQueryTableFactory, StandardSchemaV1, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };
+export type { CacheOptions, GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryDateTimeRenderOption, GQueryGetValuesOptions, GQueryInsertDataOption, GQueryMajorDimension, GQueryMeasurement, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueInputOption, GQueryValueRangeInput, GQueryValueRangeResult, GQueryValueRenderOption, GQueryValues, GQueryWriteMetadata, GQueryWriteValuesOptions, InferSchema };

@@ -1,5 +1,10 @@
 const KEY_INDEX_KEY = "gq:__keys__";
-let writeObserver: ((sheetName: string) => void) | undefined;
+export interface GQueryWriteMetadata {
+  spreadsheetId: string;
+  /** Omitted when the operation can affect arbitrary columns or row structure. */
+  columns?: readonly string[];
+}
+let writeObserver: ((sheetName: string, metadata?: GQueryWriteMetadata) => void) | undefined;
 
 /** Optional application invalidation hook; invoked only after successful writes. */
 export function configureGQueryWriteObserver(next?: typeof writeObserver): void {
@@ -42,8 +47,8 @@ export function readThrough<T>(
   return value;
 }
 
-export function invalidateSheet(sheetName: string): void {
-  try { writeObserver?.(sheetName); } catch { /* A committed write stands. */ }
+export function invalidateSheet(sheetName: string, metadata?: GQueryWriteMetadata): void {
+  try { writeObserver?.(sheetName, metadata); } catch { /* A committed write stands. */ }
   try {
     const cache = CacheService.getScriptCache();
     // Cache invalidation follows a committed write and must never change its result.

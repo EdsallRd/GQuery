@@ -360,18 +360,22 @@ function getInternal(GQueryTableFactory, options, orderBy, limit, offset) {
     }
     // Read data from all required sheets at once
     const results = GQuery.getMany(sheetsToRead, options);
+    return querySnapshotRows(results, GQueryTable.sheetName, GQueryTableFactory, options, GQueryTable.schema, orderBy, limit, offset);
+}
+/** Pure query evaluation; never accesses Sheets or creates native handles. */
+function querySnapshotRows(results, sheetName, plan, options, schema, orderBy, limit, offset) {
     // If the main sheet doesn't exist or has no data
-    if (!results[GQueryTable.sheetName] ||
-        results[GQueryTable.sheetName].rows.length === 0) {
+    if (!results[sheetName] ||
+        results[sheetName].rows.length === 0) {
         return { headers: [], rows: [] };
     }
     // Get data for the primary table
-    let result = results[GQueryTable.sheetName];
+    let result = results[sheetName];
     let rows = result.rows;
     let headers = result.headers;
     // Process each join sequentially
-    if (GQueryTableFactory.joinOption.length > 0) {
-        GQueryTableFactory.joinOption.forEach((joinConfig) => {
+    if (plan.joinOption.length > 0) {
+        plan.joinOption.forEach((joinConfig) => {
             const { sheetName, sheetColumn, joinColumn, columnsToReturn } = joinConfig;
             const joinData = results[sheetName];
             if (!joinData || !joinData.rows || joinData.rows.length === 0) {
@@ -415,14 +419,14 @@ function getInternal(GQueryTableFactory, options, orderBy, limit, offset) {
         });
     }
     // Apply filter if specified
-    if (GQueryTableFactory.filterOption) {
-        rows = rows.filter(GQueryTableFactory.filterOption);
+    if (plan.filterOption) {
+        rows = rows.filter(plan.filterOption);
     }
     // Apply select if specified — narrows columns and shifts the effective `headers`
     // we return. Sort/paginate/validate run once below regardless of branch.
     let outputHeaders = headers;
-    if (GQueryTableFactory.selectOption &&
-        GQueryTableFactory.selectOption.length > 0) {
+    if (plan.selectOption &&
+        plan.selectOption.length > 0) {
         // Create a map to track columns from joined tables
         const joinedColumns = new Set();
         // Collect all columns from joined tables
@@ -438,18 +442,18 @@ function getInternal(GQueryTableFactory, options, orderBy, limit, offset) {
         let selectedHeaders;
         // Check if any of the selected headers is "Model" or "Model_Name"
         // If we're selecting the join columns, we want to include all related joined fields
-        if (GQueryTableFactory.selectOption.some((header) => header === "Model" ||
+        if (plan.selectOption.some((header) => header === "Model" ||
             header === "Model_Name" ||
-            GQueryTableFactory.joinOption.some((j) => j.joinColumn === header || j.sheetColumn === header))) {
+            plan.joinOption.some((j) => j.joinColumn === header || j.sheetColumn === header))) {
             // Include all join-related columns and the selected columns
-            selectedHeaders = [...GQueryTableFactory.selectOption];
+            selectedHeaders = [...plan.selectOption];
             joinedColumns.forEach((joinCol) => {
                 selectedHeaders.push(joinCol);
             });
         }
         else {
             // Otherwise only include explicitly selected columns
-            selectedHeaders = [...GQueryTableFactory.selectOption];
+            selectedHeaders = [...plan.selectOption];
         }
         // Remove duplicates
         selectedHeaders = [...new Set(selectedHeaders)];
@@ -471,8 +475,8 @@ function getInternal(GQueryTableFactory, options, orderBy, limit, offset) {
     rows = sortRows(rows, orderBy);
     rows = paginateRows(rows, offset, limit);
     // Apply schema validation if requested
-    const typedRows = GQueryTable.schema && (options === null || options === void 0 ? void 0 : options.validate)
-        ? applySchemaToRows(GQueryTable.schema, rows)
+    const typedRows = schema && (options === null || options === void 0 ? void 0 : options.validate)
+        ? applySchemaToRows(schema, rows)
         : rows;
     return {
         headers: outputHeaders,
@@ -582,9 +586,9 @@ function readThrough(opts, sheetName, producer) {
     }
     return value;
 }
-function invalidateSheet(sheetName) {
+function invalidateSheet(sheetName, metadata) {
     try {
-        writeObserver === null || writeObserver === void 0 ? void 0 : writeObserver(sheetName);
+        writeObserver === null || writeObserver === void 0 ? void 0 : writeObserver(sheetName, metadata);
     }
     catch { /* A committed write stands. */ }
     try {
@@ -665,6 +669,7 @@ function updateInternal(GQueryTableFactory, updateFn) {
     });
     // Collect changed cells
     const changedCells = new Map();
+    const changedColumns = new Set();
     updatedRows.forEach((updatedRow) => {
         const rowIndex = updatedRow.__meta.rowNum - 2;
         const originalRow = rows[rowIndex];
@@ -674,6 +679,7 @@ function updateInternal(GQueryTableFactory, updateFn) {
             // Skip if values are the same
             if (originalValue === updatedValue)
                 return;
+            changedColumns.add(header);
             // Only update if value changed or is being set/cleared
             if (updatedValue !== undefined && updatedValue !== null) {
                 const columnLetter = getColumnLetter(columnIndex);
@@ -699,7 +705,7 @@ function updateInternal(GQueryTableFactory, updateFn) {
             valueInputOption: "USER_ENTERED",
         };
         callHandler(() => Sheets.Spreadsheets.Values.batchUpdate(batchUpdateRequest, spreadsheetId), retries, "values.batchUpdate", optimizedUpdates.length);
-        invalidateSheet(sheetName);
+        invalidateSheet(sheetName, { spreadsheetId, columns: [...changedColumns] });
     }
     return {
         rows: filteredRows.length > 0 ? typedRows : [],
@@ -924,6 +930,91 @@ function deleteInternal(GQueryTableFactory) {
     }
 }
 
+function copy(value) {
+    if (value instanceof Date)
+        return new Date(value.getTime());
+    if (Array.isArray(value))
+        return value.map(copy);
+    if (value !== null && typeof value === "object") {
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, copy(item)]));
+    }
+    return value;
+}
+/** Explicit, read-only snapshot. Create a new one after writes; never shared across RPCs. */
+class GQueryReadSnapshot {
+    constructor(tables) { this.tables = copy(tables); }
+    from(sheetName) {
+        if (!Object.prototype.hasOwnProperty.call(this.tables, sheetName))
+            throw new Error(`Sheet not captured in snapshot: ${sheetName}`);
+        return new GQuerySnapshotTable(this.tables, sheetName);
+    }
+}
+class GQuerySnapshotTable {
+    constructor(tables, sheetName) {
+        this.tables = tables;
+        this.sheetName = sheetName;
+        this.plan = { joinOption: [] };
+    }
+    where(predicate) { this.plan.filterOption = predicate; return this; }
+    select(columns) { this.plan.selectOption = [...columns]; return this; }
+    join(sheetName, sheetColumn, joinColumn, columnsToReturn) {
+        if (!Object.prototype.hasOwnProperty.call(this.tables, sheetName))
+            throw new Error(`Sheet not captured in snapshot: ${sheetName}`);
+        this.plan.joinOption.push({ sheetName, sheetColumn, joinColumn, columnsToReturn });
+        return this;
+    }
+    orderBy(field, direction = "asc") { this.ordering = { field, direction }; return this; }
+    limit(count) { this.count = count; return this; }
+    offset(skip) { this.skip = skip; return this; }
+    get() {
+        // Copy before callbacks so even a mutating predicate cannot modify the snapshot.
+        return querySnapshotRows(copy(this.tables), this.sheetName, this.plan, undefined, undefined, this.ordering, this.count, this.skip);
+    }
+}
+
+function columnLetter(index) {
+    let result = "";
+    for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+        result = String.fromCharCode(65 + (value - 1) % 26) + result;
+    }
+    return result;
+}
+/** Explicit projection, including dependencies needed by caller-side filters/joins. */
+function getManyProjectedInternal(client, selections, options = {}) {
+    var _a, _b;
+    const sheets = Object.keys(selections);
+    if (sheets.length === 0)
+        return {};
+    const render = { valueRenderOption: (_a = options.valueRenderOption) !== null && _a !== void 0 ? _a : "FORMATTED_VALUE",
+        dateTimeRenderOption: (_b = options.dateTimeRenderOption) !== null && _b !== void 0 ? _b : "FORMATTED_STRING" };
+    const headers = client.batchGetValues(sheets.map((sheet) => sheetRange(sheet, "1:1")), render);
+    const plans = sheets.map((sheet, index) => {
+        var _a;
+        const available = ((_a = headers[index].values[0]) !== null && _a !== void 0 ? _a : []).map(String);
+        const selected = [...new Set(selections[sheet])];
+        const indexes = selected.map((column) => {
+            const matches = available.flatMap((header, position) => header === column ? [position] : []);
+            if (matches.length !== 1)
+                throw new Error(`Projected column must exist exactly once: ${sheet}.${column}`);
+            return matches[0];
+        });
+        return { sheet, selected, indexes };
+    });
+    const ranges = plans.flatMap((plan) => plan.indexes.map((index) => {
+        const letter = columnLetter(index);
+        return sheetRange(plan.sheet, `${letter}2:${letter}`);
+    }));
+    const values = client.batchGetValues(ranges, render);
+    let cursor = 0;
+    return Object.fromEntries(plans.map(({ sheet, selected, indexes }) => {
+        const columns = indexes.map(() => values[cursor++].values);
+        const count = Math.max(0, ...columns.map((column) => column.length));
+        const matrix = Array.from({ length: count }, (_, row) => columns.map((column) => { var _a, _b; return (_b = (_a = column[row]) === null || _a === void 0 ? void 0 : _a[0]) !== null && _b !== void 0 ? _b : ""; }));
+        return [sheet, { headers: selected,
+                rows: parseRows(selected, matrix).map((row) => convertRowTypes(row, selected)) }];
+    }));
+}
+
 function valuesMatrix(values) {
     if (!Array.isArray(values))
         throw new TypeError("Values must be a two-dimensional array.");
@@ -965,9 +1056,17 @@ function normalizedUpdate(response, spreadsheetId, fallbackRange) {
             : null,
     };
 }
-function invalidateRanges(ranges) {
+function invalidateRanges(ranges, spreadsheetId) {
     const sheetNames = new Set(ranges.map(sheetNameFromRange).filter((name) => name !== null));
-    sheetNames.forEach(invalidateSheet);
+    sheetNames.forEach((sheet) => invalidateSheet(sheet, { spreadsheetId }));
+}
+function batchGetValuesInternal(client, ranges, options = {}) {
+    if (ranges.length === 0)
+        return [];
+    const response = callHandler(() => Sheets.Spreadsheets.Values.batchGet(client.spreadsheetId, {
+        ranges: [...ranges], ...options,
+    }), client.retries, "values.batchGet", ranges.length);
+    return ranges.map((range, index) => { var _a; return normalizedValueRange((_a = response === null || response === void 0 ? void 0 : response.valueRanges) === null || _a === void 0 ? void 0 : _a[index], range); });
 }
 function getValuesInternal(client, range, options = {}) {
     const response = callHandler(() => Sheets.Spreadsheets.Values.get(client.spreadsheetId, range, {
@@ -987,7 +1086,7 @@ function updateValuesInternal(client, range, values, options = {}) {
             responseDateTimeRenderOption: options.responseDateTimeRenderOption,
         });
     }, client.retries, "values.update");
-    invalidateRanges([range]);
+    invalidateRanges([range], client.spreadsheetId);
     return normalizedUpdate(response, client.spreadsheetId, range);
 }
 function batchUpdateValuesInternal(client, ranges, options = {}) {
@@ -1014,7 +1113,7 @@ function batchUpdateValuesInternal(client, ranges, options = {}) {
             responseDateTimeRenderOption: options.responseDateTimeRenderOption,
         }, client.spreadsheetId);
     }, client.retries, "values.batchUpdate", ranges.length);
-    invalidateRanges(ranges.map(({ range }) => range));
+    invalidateRanges(ranges.map(({ range }) => range), client.spreadsheetId);
     return {
         spreadsheetId: (_a = response === null || response === void 0 ? void 0 : response.spreadsheetId) !== null && _a !== void 0 ? _a : client.spreadsheetId,
         totalUpdatedRows: (_b = response === null || response === void 0 ? void 0 : response.totalUpdatedRows) !== null && _b !== void 0 ? _b : 0,
@@ -1039,7 +1138,7 @@ function appendValuesInternal(client, range, values, options = {}) {
     const updatedRange = (_a = response === null || response === void 0 ? void 0 : response.updates) === null || _a === void 0 ? void 0 : _a.updatedRange;
     if (!updatedRange)
         throw new Error("Sheets append did not return an updated range.");
-    invalidateRanges([range]);
+    invalidateRanges([range], client.spreadsheetId);
     return {
         ...normalizedUpdate(response.updates, client.spreadsheetId, updatedRange),
         tableRange: (_b = response.tableRange) !== null && _b !== void 0 ? _b : null,
@@ -1079,6 +1178,28 @@ class GQuery {
     getValues(range, options) {
         return getValuesInternal(this, range, options);
     }
+    /** Read multiple targeted ranges in one Sheets request, preserving input order. */
+    batchGetValues(ranges, options) {
+        return batchGetValuesInternal(this, ranges, options);
+    }
+    /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
+    getManyProjected(selections, options) {
+        return getManyProjectedInternal(this, selections, options);
+    }
+    /** Capture explicit read-only tables for reuse within the current operation. */
+    readSnapshot(sheetNames, options) {
+        return new GQueryReadSnapshot(this.getMany([...sheetNames], options));
+    }
+    /** Structural atomic batch. Append-containing batches must not be blindly replayed. */
+    batchUpdate(requests, options = {}) {
+        var _a, _b;
+        if (requests.length === 0)
+            return { spreadsheetId: this.spreadsheetId, replies: [] };
+        const response = callHandler(() => Sheets.Spreadsheets.batchUpdate({ requests: [...requests] }, this.spreadsheetId), (_a = options.retries) !== null && _a !== void 0 ? _a : 0, "spreadsheets.batchUpdate", requests.length);
+        for (const sheet of new Set((_b = options.affectedSheets) !== null && _b !== void 0 ? _b : []))
+            invalidateSheet(sheet, { spreadsheetId: this.spreadsheetId });
+        return response;
+    }
     /** Update one targeted A1 range and invalidate its sheet cache. */
     updateValues(range, values, options) {
         return updateValuesInternal(this, range, values, options);
@@ -1111,12 +1232,19 @@ class GQuery {
  * @typeParam T - The shape of each data row. Inferred from a Standard Schema if provided.
  */
 class GQueryTable {
+    get spreadsheet() {
+        var _a;
+        return (_a = this.nativeSpreadsheet) !== null && _a !== void 0 ? _a : this.GQuery.resolveTable(this.spreadsheetId, this.sheetName).spreadsheet;
+    }
+    set spreadsheet(value) { this.nativeSpreadsheet = value; }
+    get sheet() {
+        var _a;
+        return (_a = this.nativeSheet) !== null && _a !== void 0 ? _a : this.GQuery.resolveTable(this.spreadsheetId, this.sheetName).sheet;
+    }
+    set sheet(value) { this.nativeSheet = value; }
     constructor(GQuery, spreadsheetId, sheetName, schema) {
         this.spreadsheetId = spreadsheetId;
         this.sheetName = sheetName;
-        const handles = GQuery.resolveTable(spreadsheetId, sheetName);
-        this.spreadsheet = handles.spreadsheet;
-        this.sheet = handles.sheet;
         this.GQuery = GQuery;
         this.schema = schema;
     }
@@ -1207,7 +1335,7 @@ class GQueryTable {
         const dataArray = Array.isArray(data) ? data : [data];
         const result = appendInternal(this, dataArray, options);
         if (dataArray.length > 0)
-            invalidateSheet(this.sheetName);
+            invalidateSheet(this.sheetName, { spreadsheetId: this.spreadsheetId });
         return result;
     }
     /**
@@ -1218,7 +1346,7 @@ class GQueryTable {
      */
     appendOne(row, options) {
         const result = appendOneInternal(this, row, options);
-        invalidateSheet(this.sheetName);
+        invalidateSheet(this.sheetName, { spreadsheetId: this.spreadsheetId });
         return result;
     }
     /**
@@ -1341,15 +1469,15 @@ class GQueryTableFactory {
         const dataArray = Array.isArray(data) ? data : [data];
         const result = appendInternal(this.GQueryTable, dataArray, options);
         if (dataArray.length > 0)
-            invalidateSheet(this.GQueryTable.sheetName);
+            invalidateSheet(this.GQueryTable.sheetName, { spreadsheetId: this.GQueryTable.spreadsheetId });
         return result;
     }
     delete() {
         const result = deleteInternal(this);
         if (result.deletedRows > 0)
-            invalidateSheet(this.GQueryTable.sheetName);
+            invalidateSheet(this.GQueryTable.sheetName, { spreadsheetId: this.GQueryTable.spreadsheetId });
         return result;
     }
 }
 
-export { DateTimeRenderOption, GQuery, GQuerySchemaError, GQueryTable, GQueryTableFactory, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };
+export { DateTimeRenderOption, GQuery, GQueryReadSnapshot, GQuerySchemaError, GQueryTable, GQueryTableFactory, ValueRenderOption, configureGQueryObserver, configureGQueryWriteObserver, quoteSheetName, sheetNameFromRange, sheetRange };

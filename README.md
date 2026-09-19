@@ -397,3 +397,40 @@ The QUERY method is especially fast for large spreadsheets, as it leverages Goog
 | -------------- | :---------: | :----------------: |
 | GET            |   7890ms    |       8199ms       |
 | QUERY          |   7844ms    |       1821ms       |
+
+
+### Explicit efficient reads and atomic structural writes
+
+`from()` now resolves native SpreadsheetApp handles only when `.sheet` or
+`.spreadsheet` is accessed. Ordinary Values reads do not open native handles.
+
+```ts
+const ranges = db.batchGetValues(["'Assets'!A2:A", "'Assets'!D2:D"]);
+const tables = db.getManyProjected({ Assets: ["Id", "Assigned_To", "Assigned_Confirmed"] });
+const snapshot = db.readSnapshot(["Assets", "Models"]);
+const rows = snapshot.from("Assets").join("Models", "Model_Name", "Model")
+  .where((row) => row.Status === "Assigned").get().rows;
+```
+
+Projected reads fetch fresh headers in one batch, then selected columns in a
+second batch. Include every field needed by subsequent filters and joins, plus
+an identity column to retain rows whose other selected cells are blank. Missing
+or duplicate requested headers fail before reading data. Existing `select()`
+remains an in-memory projection and does not reduce the Sheets range.
+
+Snapshots are explicit read-only values; independent query builders reuse the
+captured tables without service calls. Results and predicate arguments are
+isolated copies. Create a new snapshot after writes, and do not reuse display
+snapshots for mutation preconditions or across RPC executions.
+
+`db.batchUpdate(requests, { affectedSheets: ["Assets", "Workflow Outbox"] })`
+exposes one structural Sheets batch request. It defaults to **zero retries**:
+callers must reconcile ambiguous outcomes before replaying appends. Declare all
+affected sheets so confirmed writes invalidate caches; failures do not announce
+a successful write. An empty request list does not call Sheets.
+
+`configureGQueryWriteObserver((sheetName, metadata) => ...)` retains its first
+argument and optionally receives `{ spreadsheetId, columns }`. Table updates
+report changed header names; range, append, delete, and structural operations
+omit `columns` to indicate broad invalidation. Observer failures never alter a
+committed write.

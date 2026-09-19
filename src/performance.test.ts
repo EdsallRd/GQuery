@@ -41,13 +41,13 @@ it("reuses handles per instance and spreadsheet without caching table reads or q
   expect(first.sheet).toBe(second.sheet);
   first.get();
   second.get();
-  query.from("Students");
+  query.from("Students").sheet;
   expect(openById).toHaveBeenCalledTimes(1);
   expect(getSheetByName).toHaveBeenCalledTimes(2);
   expect(read).toHaveBeenCalledTimes(2);
   query.spreadsheetId = "second";
-  query.from("Assets");
-  new GQuery("first").from("Assets");
+  query.from("Assets").sheet;
+  new GQuery("first").from("Assets").sheet;
   expect(openById.mock.calls.map(([id]) => id)).toEqual(["first", "second", "first"]);
 });
 
@@ -72,7 +72,7 @@ it("invalidates an actual table update once and contains write-observer failures
   configureGQueryWriteObserver(observer);
   expect(new GQuery("spreadsheet").from("Assets").update(() => ({ name: "after" })).rows[0].name).toBe("after");
   expect(write).toHaveBeenCalledTimes(1);
-  expect(observer).toHaveBeenCalledExactlyOnceWith("Assets");
+  expect(observer).toHaveBeenCalledExactlyOnceWith("Assets", { spreadsheetId: "spreadsheet", columns: ["name"] });
   expect(cache.remove).toHaveBeenCalledExactlyOnceWith("gq:Assets:list");
 });
 

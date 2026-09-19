@@ -1,6 +1,9 @@
 import { type CacheOptions } from "./cache";
+import { GQueryReadSnapshot } from "./snapshot";
+export { GQueryReadSnapshot } from "./snapshot";
 import { GQueryAppendValuesOptions, GQueryAppendValuesResult, GQueryBatchUpdateValuesResult, GQueryCellValue, GQueryGetValuesOptions, GQueryOptions, GQueryReadOptions, GQueryResult, GQueryRow, GQueryUpdateValuesResult, GQueryValueRangeInput, GQueryValueRangeResult, GQueryWriteValuesOptions, InferSchema, StandardSchemaV1 } from "./types";
 export type { CacheOptions };
+export type { GQueryWriteMetadata } from "./cache";
 export { configureGQueryWriteObserver } from "./cache";
 export * from "./types";
 export * from "./a1";
@@ -26,6 +29,17 @@ export declare class GQuery {
     };
     /** Read one targeted A1 range without loading an entire sheet. */
     getValues(range: string, options?: GQueryGetValuesOptions): GQueryValueRangeResult;
+    /** Read multiple targeted ranges in one Sheets request, preserving input order. */
+    batchGetValues(ranges: readonly string[], options?: GQueryGetValuesOptions): GQueryValueRangeResult[];
+    /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
+    getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult>;
+    /** Capture explicit read-only tables for reuse within the current operation. */
+    readSnapshot(sheetNames: readonly string[], options?: GQueryReadOptions): GQueryReadSnapshot;
+    /** Structural atomic batch. Append-containing batches must not be blindly replayed. */
+    batchUpdate(requests: readonly GoogleAppsScript.Sheets.Schema.Request[], options?: {
+        affectedSheets?: readonly string[];
+        retries?: number;
+    }): GoogleAppsScript.Sheets.Schema.BatchUpdateSpreadsheetResponse;
     /** Update one targeted A1 range and invalidate its sheet cache. */
     updateValues(range: string, values: readonly (readonly GQueryCellValue[])[], options?: GQueryWriteValuesOptions): GQueryUpdateValuesResult;
     /** Atomically update several targeted A1 ranges. */
@@ -74,9 +88,13 @@ export declare class GQuery {
 export declare class GQueryTable<T extends Record<string, any> = Record<string, any>> {
     GQuery: GQuery;
     spreadsheetId: string;
-    spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet;
+    private nativeSpreadsheet?;
+    private nativeSheet?;
     sheetName: string;
-    sheet: GoogleAppsScript.Spreadsheet.Sheet;
+    get spreadsheet(): GoogleAppsScript.Spreadsheet.Spreadsheet;
+    set spreadsheet(value: GoogleAppsScript.Spreadsheet.Spreadsheet);
+    get sheet(): GoogleAppsScript.Spreadsheet.Sheet;
+    set sheet(value: GoogleAppsScript.Spreadsheet.Sheet);
     /** The Standard Schema used for type inference and optional runtime validation */
     schema?: StandardSchemaV1<unknown, T>;
     /** Cache options set by .cached() — undefined means no caching */

@@ -70,11 +70,23 @@ function normalizedUpdate(
   };
 }
 
-function invalidateRanges(ranges: readonly string[]): void {
+function invalidateRanges(ranges: readonly string[], spreadsheetId: string): void {
   const sheetNames = new Set(
     ranges.map(sheetNameFromRange).filter((name): name is string => name !== null),
   );
-  sheetNames.forEach(invalidateSheet);
+  sheetNames.forEach((sheet) => invalidateSheet(sheet, { spreadsheetId }));
+}
+
+export function batchGetValuesInternal(
+  client: ValuesClient,
+  ranges: readonly string[],
+  options: GQueryGetValuesOptions = {},
+): GQueryValueRangeResult[] {
+  if (ranges.length === 0) return [];
+  const response = callHandler(() => Sheets!.Spreadsheets!.Values!.batchGet(client.spreadsheetId, {
+    ranges: [...ranges], ...options,
+  }), client.retries, "values.batchGet", ranges.length);
+  return ranges.map((range, index) => normalizedValueRange(response?.valueRanges?.[index], range));
 }
 
 export function getValuesInternal(
@@ -117,7 +129,7 @@ export function updateValuesInternal(
     client.retries,
     "values.update",
   );
-  invalidateRanges([range]);
+  invalidateRanges([range], client.spreadsheetId);
   return normalizedUpdate(response, client.spreadsheetId, range);
 }
 
@@ -154,7 +166,7 @@ export function batchUpdateValuesInternal(
     "values.batchUpdate",
     ranges.length,
   );
-  invalidateRanges(ranges.map(({ range }) => range));
+  invalidateRanges(ranges.map(({ range }) => range), client.spreadsheetId);
   return {
     spreadsheetId: response?.spreadsheetId ?? client.spreadsheetId,
     totalUpdatedRows: response?.totalUpdatedRows ?? 0,
@@ -192,7 +204,7 @@ export function appendValuesInternal(
   );
   const updatedRange = response?.updates?.updatedRange;
   if (!updatedRange) throw new Error("Sheets append did not return an updated range.");
-  invalidateRanges([range]);
+  invalidateRanges([range], client.spreadsheetId);
   return {
     ...normalizedUpdate(response.updates, client.spreadsheetId, updatedRange),
     tableRange: response.tableRange ?? null,
