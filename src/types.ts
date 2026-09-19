@@ -128,6 +128,11 @@ export interface GQueryAppendValuesResult extends GQueryUpdateValuesResult {
 /**
  * Options for reading data from Google Sheets
  */
+export type GQueryProjectedReadOptions = GQueryReadOptions & {
+  /** Missing legacy display columns become empty cells; duplicate headers still fail. */
+  optionalColumns?: Record<string, readonly string[]>;
+};
+
 export type GQueryReadOptions = {
   /** How values should be rendered in the output */
   valueRenderOption?: ValueRenderOption | GQueryValueRenderOption;

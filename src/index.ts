@@ -22,6 +22,7 @@ import {
   GQueryGetValuesOptions,
   GQueryOptions,
   GQueryReadOptions,
+  GQueryProjectedReadOptions,
   GQueryResult,
   GQueryRow,
   GQueryUpdateValuesResult,
@@ -90,7 +91,7 @@ export class GQuery {
   }
 
   /** Read only explicitly selected columns; headers are resolved fresh in one batch. */
-  getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryReadOptions): Record<string, GQueryResult> {
+  getManyProjected(selections: Record<string, readonly string[]>, options?: GQueryProjectedReadOptions): Record<string, GQueryResult> {
     return getManyProjectedInternal(this, selections, options);
   }
 

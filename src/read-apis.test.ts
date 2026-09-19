@@ -51,6 +51,20 @@ it("rejects missing or ambiguous projected headers before fetching data", () => 
   expect(request).toHaveBeenCalledOnce();
 });
 
+it("fills explicitly optional missing columns while preserving required identities and rejecting duplicates", () => {
+  const request = vi.spyOn(Sheets!.Spreadsheets.Values, "batchGet")
+    .mockReturnValueOnce({ valueRanges: [{ values: [["Id", "Confirmed"]] }] })
+    .mockReturnValueOnce({ valueRanges: [{ values: [["001"], ["002"]] }, { values: [["TRUE"], ["FALSE"]] }] });
+  const result = new GQuery("db").getManyProjected({ Assets: ["Id", "Assigned_Date", "Confirmed"] }, {
+    optionalColumns: { Assets: ["Assigned_Date"] },
+  });
+  expect((request.mock.calls[1][1] as { ranges: string[] }).ranges).toEqual(["'Assets'!A2:A", "'Assets'!B2:B"]);
+  expect(result.Assets.rows.map((row) => [row.Id, row.Assigned_Date, row.Confirmed])).toEqual([["001", "", true], ["002", "", false]]);
+  request.mockReset().mockReturnValue({ valueRanges: [{ values: [["Assigned_Date", "Assigned_Date"]] }] });
+  expect(() => new GQuery("db").getManyProjected({ Assets: ["Assigned_Date"] }, { optionalColumns: { Assets: ["Assigned_Date"] } })).toThrow("exactly once");
+  expect(() => new GQuery("db").getManyProjected({ Assets: ["Id"] }, { optionalColumns: { Assets: ["Assigned_Date"] } })).toThrow("exactly once");
+});
+
 it("snapshot queries are isolated from callback mutations and perform no additional reads", () => {
   const request = vi.spyOn(Sheets!.Spreadsheets.Values, "batchGet").mockReturnValue({ valueRanges: [
     { values: [["id", "Model"], ["1", "M"], ["2", "N"]] },

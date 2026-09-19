@@ -1,7 +1,7 @@
 import type { GQuery } from "./index";
 import { sheetRange } from "./a1";
 import { convertRowTypes, parseRows } from "./utils";
-import type { GQueryReadOptions, GQueryResult } from "./types";
+import type { GQueryProjectedReadOptions, GQueryResult } from "./types";
 
 function columnLetter(index: number): string {
   let result = "";
@@ -13,7 +13,7 @@ function columnLetter(index: number): string {
 
 /** Explicit projection, including dependencies needed by caller-side filters/joins. */
 export function getManyProjectedInternal(
-  client: GQuery, selections: Record<string, readonly string[]>, options: GQueryReadOptions = {},
+  client: GQuery, selections: Record<string, readonly string[]>, options: GQueryProjectedReadOptions = {},
 ): Record<string, GQueryResult> {
   const sheets = Object.keys(selections);
   if (sheets.length === 0) return {};
@@ -25,19 +25,20 @@ export function getManyProjectedInternal(
     const selected = [...new Set(selections[sheet])];
     const indexes = selected.map((column) => {
       const matches = available.flatMap((header, position) => header === column ? [position] : []);
+      if (matches.length === 0 && options.optionalColumns?.[sheet]?.includes(column)) return -1;
       if (matches.length !== 1) throw new Error(`Projected column must exist exactly once: ${sheet}.${column}`);
       return matches[0];
     });
     return { sheet, selected, indexes };
   });
-  const ranges = plans.flatMap((plan) => plan.indexes.map((index) => {
+  const ranges = plans.flatMap((plan) => plan.indexes.filter((index) => index >= 0).map((index) => {
     const letter = columnLetter(index);
     return sheetRange(plan.sheet, `${letter}2:${letter}`);
   }));
   const values = client.batchGetValues(ranges, render);
   let cursor = 0;
   return Object.fromEntries(plans.map(({ sheet, selected, indexes }) => {
-    const columns = indexes.map(() => values[cursor++].values);
+    const columns = indexes.map((index) => index < 0 ? [] : values[cursor++].values);
     const count = Math.max(0, ...columns.map((column) => column.length));
     const matrix = Array.from({ length: count }, (_, row) => columns.map((column) => column[row]?.[0] ?? ""));
     return [sheet, { headers: selected,
